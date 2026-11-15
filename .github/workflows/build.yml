@@ -1,0 +1,85 @@
+# Baut die App für Mac (Apple Silicon) und Windows 11 und prüft sie vorher.
+# Bei einem Versions-Tag (v1.0.0) entsteht daraus ein GitHub-Release mit den Installationsdateien.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Abhängigkeiten
+        run: pip install -r requirements.txt pillow
+      - name: Test
+        run: python tests/test_app.py
+      - name: App bauen
+        run: pyinstaller --noconfirm packaging/crm.spec
+      - name: DMG erstellen
+        run: |
+          VERSION=$(python -c "import re;print(re.search(r'^VERSION = \"([^\"]+)\"', open('server.py').read(), re.M)[1])")
+          mkdir -p dmg
+          cp -R "dist/Meerkoetter CRM.app" dmg/
+          ln -s /Applications dmg/Programme
+          hdiutil create -volname "Meerkötter CRM" -srcfolder dmg -ov -format UDZO "dist/Meerkoetter-CRM-$VERSION-Mac-AppleSilicon.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: dist/*.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Abhängigkeiten
+        run: pip install -r requirements.txt pillow
+      - name: Test
+        run: python tests/test_app.py
+      - name: App bauen
+        run: pyinstaller --noconfirm packaging/crm.spec
+      - name: Installationsprogramm erstellen
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path server.py -Pattern '^VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup --no-progress -y
+            $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc "/DAppVersion=$version" packaging\windows-installer.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Release veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" files/* --repo "$GITHUB_REPOSITORY" \
+            --title "Meerkötter CRM ${GITHUB_REF_NAME#v}" \
+            --notes "Installation: siehe README. Mac: DMG öffnen und die App in den Ordner Programme ziehen. Windows 11: Setup ausführen."

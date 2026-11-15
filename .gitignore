@@ -1,0 +1,23 @@
+# Öffentliches Repository: nur ausdrücklich freigegebene Programmdateien.
+# Alles andere bleibt draußen, vor allem LISTEN/ mit echten Firmen- und Personendaten.
+/*
+!/.gitignore
+!/.github/
+!/app.py
+!/server.py
+!/ocr.js
+!/ocr.ps1
+!/pdftext.js
+!/static/
+!/packaging/
+!/tests/
+!/requirements.txt
+!/README.md
+!/LIESMICH.md
+!/CRM starten.command
+__pycache__/
+.DS_Store
+*.sqlite
+*.crmdaten
+*.csv
+*.xlsx

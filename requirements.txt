@@ -1,0 +1,4 @@
+# Nur für die gebaute App nötig. Das CRM selbst läuft mit der Python-Standardbibliothek (python3 server.py).
+pywebview==6.2.1
+pypdf==7.1.0
+pyinstaller==6.22.3
