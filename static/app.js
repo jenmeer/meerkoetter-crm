@@ -950,7 +950,7 @@ const SHOT_LABELS = {
 // Liest einen Betrag aus einer Bildzeile. Zeichen danach (Pfeile, Lesefehler) werden ignoriert,
 // aber nur, wenn die Zahl davor vollständig ist: "205.11ął" wird verworfen statt falsch gelesen.
 function shotAmount(text) {
-  const t = text.trim().replace(/(?<=[€\s.\d])[Oo](?=[\d.\s(]|$)/g, "0");
+  const t = text.trim().replace(/(?<=[€\s.\d])[Oo]+(?=[\d.\s(,]|$)/g, (m) => "0".repeat(m.length));
   const match = /^(-?)\s*€\s*(-?)\s*(\d{1,3}(?:\.\d{3})*)(?:,\d{1,2})?(?![\d.,])/.exec(t);
   if (!match) return null;
   const value = Number(match[3].replace(/\./g, ""));

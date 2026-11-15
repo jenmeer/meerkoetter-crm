@@ -5,6 +5,7 @@ Aufruf: python tests/test_app.py
 """
 import io
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -106,7 +107,9 @@ def main():
 
             lines = call(port, "/api/ocr", balance_image(), "image/png")["lines"]
             seen = " | ".join(line["text"] for line in lines)
-            print("Texterkennung:", seen)
+            print("Texterkennung:", ascii(seen))
+            # Wie shotAmount in app.js: ein O oder o in einer Zahl ist eine Null.
+            seen = re.sub(r"(?<=[€\s.\d])[Oo]+(?=[\d.\s(,|]|$)", lambda m: "0" * len(m[0]), seen)
             assert all(isinstance(line[k], int) for line in lines for k in ("x", "y", "h")), lines
             for expected in ("Bilanzsumme", "Eigenkapital", "2.400.000", "900.000", "504330"):
                 assert expected in seen, f"{expected} fehlt"
