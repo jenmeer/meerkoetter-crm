@@ -95,6 +95,48 @@ function ownerLink(row) {
     ? companyLink(row.company_id, row.company_name)
     : personLink(row, row.contact_id);
 }
+// Bereichsfilter Firma / Privat aus der Kopfzeile. Gilt für Übersicht, Personen und Pipeline.
+const AREA_KEY = "crm-bereich";
+let area = "";
+try { area = localStorage.getItem(AREA_KEY) || ""; } catch { /* ohne gespeicherte Wahl */ }
+if (!["", "firma", "privat"].includes(area)) area = "";
+function areaParam(prefix = "?") {
+  return area ? `${prefix}bereich=${area}` : "";
+}
+function initAreaFilter() {
+  const buttons = [...document.querySelectorAll("#area-filter [data-area]")];
+  const sync = () => buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.area === area)));
+  buttons.forEach((b) => b.addEventListener("click", () => {
+    area = b.dataset.area;
+    try { localStorage.setItem(AREA_KEY, area); } catch { /* nur für diese Sitzung */ }
+    sync();
+    route();
+  }));
+  sync();
+}
+function areaTag(value) {
+  return value ? h("span", { class: `tag-area ${value}` }, meta.areas[value] || value) : null;
+}
+function areaNote() {
+  return area ? h("p", { class: "areanote" }, `Gefiltert auf ${meta.areas[area]}. Umschalten oben in der Leiste.`) : null;
+}
+function householdTag(c) {
+  return c.household_id ? h("a", { class: "tag-house", href: `#/privatkunden?haushalt=${c.household_id}`, title: "Alle Personen dieses Haushalts" },
+    `Haushalt ${c.household_name}`) : null;
+}
+// Eingabefeld mit Vorschlagsliste für Personen. Liefert das Feld und eine Funktion für die gewählte ID.
+function personPicker(people, exclude) {
+  const listId = `personen-${Math.random().toString(36).slice(2)}`;
+  const labelOf = (p) => `${personName(p)}${p.company_names ? ` (${p.company_names})` : p.household_name ? ` (Haushalt ${p.household_name})` : ""} #${p.id}`;
+  const options = people.filter((p) => p.id !== exclude);
+  const input = h("input", { list: listId, autocomplete: "off", placeholder: "Name eintippen und aus der Liste wählen" });
+  const list = h("datalist", { id: listId }, options.map((p) => h("option", { value: labelOf(p) })));
+  const chosen = () => {
+    const match = /#(\d+)$/.exec(input.value.trim());
+    return match && options.some((p) => p.id === Number(match[1])) ? Number(match[1]) : null;
+  };
+  return { field: h("div", {}, input, list), input, chosen };
+}
 function badge(status) {
   const slug = status.toLowerCase().replace(/\s+/g, "-").replace("ä", "ae").replace("ü", "ue");
   return h("span", { class: `badge badge-${slug}` }, status);
@@ -271,33 +313,41 @@ function duplicateWatch(kind, inputs, keys, record, close) {
 }
 
 async function contactDialog(contact, onSaved, preset = {}) {
-  const [companies, referrers] = await Promise.all([api("/api/companies"), api("/api/referrers")]);
-  const c = contact || { status: "Neu", consent: "Offen", ...preset };
+  const [companies, referrers, households] = await Promise.all([api("/api/companies"), api("/api/referrers"), api("/api/households")]);
+  const c = contact || { status: "Potential", consent: "Offen", private: !preset.company_id, ...preset };
   const inputs = {};
   const text = (name, attrs = {}) => (inputs[name] = h("input", { value: c[name] || "", autocomplete: "off", ...attrs }));
 
-  openDialog(contact ? "Kontakt bearbeiten" : "Neuer Kontakt", (close) => {
-    inputs.company_id = selectEl(
-      [["", "Keine Firma (Privatperson)"], ...companies.map((o) => [o.id, o.name])], c.company_id || "");
-    inputs.is_primary = h("input", { type: "checkbox", checked: Boolean(c.is_primary) });
-    inputs.status = selectEl(meta.statuses, c.status || "Neu");
+  openDialog(contact ? "Person bearbeiten" : "Neue Person", (close) => {
+    inputs.private = h("input", { type: "checkbox", checked: Boolean(c.private) });
+    inputs.status = selectEl(meta.statuses, c.status || "Potential");
     inputs.consent = selectEl(meta.consents, c.consent || "Offen");
     const source = sourceFields(c, inputs, referrers);
+    const houseList = h("datalist", { id: "haushalte" }, households.map((x) => h("option", { value: x.name })));
+    inputs.household = h("input", { value: c.household_name || "", list: "haushalte", autocomplete: "off", placeholder: "zum Beispiel Familie Muster" });
 
-    const companyBlock = h("div", { class: "form" },
-      field("Funktion in der Firma", text("role", { placeholder: "zum Beispiel Geschäftsführung" })),
-      h("label", { class: "check" }, inputs.is_primary, "Hauptansprechperson dieser Firma"));
     const privateBlock = h("div", { class: "form" },
-      h("div", { class: "form-row" }, field("Status", inputs.status), source.source),
+      h("div", { class: "form-row" }, field("Status als Privatkunde", inputs.status), source.source),
       source.referrer);
-    const sync = () => {
-      const hasCompany = Boolean(inputs.company_id.value);
-      companyBlock.hidden = !hasCompany;
-      privateBlock.hidden = hasCompany;
-    };
-    inputs.company_id.addEventListener("change", sync);
-    sync();
-    // Felder entstehen erst unten beim Aufbau, daher die Prüfung danach anhängen.
+    const syncPrivate = () => { privateBlock.hidden = !inputs.private.checked; };
+    inputs.private.addEventListener("change", syncPrivate);
+    syncPrivate();
+
+    // Beim Anlegen gleich mit einer Firma verbinden; weitere Firmen auf der Personenseite.
+    let linkPart = null;
+    if (!contact) {
+      inputs.company_id = selectEl([["", "Keine Firma"], ...companies.map((o) => [o.id, o.name])], preset.company_id || "");
+      inputs.link_kind = selectEl(meta.linkKinds, "Ansprechpartner/in");
+      inputs.is_primary = h("input", { type: "checkbox" });
+      const linkBlock = h("div", { class: "form" },
+        h("div", { class: "form-row" }, field("Rolle in der Firma", inputs.link_kind),
+          field("Funktion", text("role", { placeholder: "zum Beispiel Geschäftsführer" }))),
+        h("label", { class: "check" }, inputs.is_primary, "Hauptansprechperson dieser Firma"));
+      const syncLink = () => { linkBlock.hidden = !inputs.company_id.value; };
+      inputs.company_id.addEventListener("change", syncLink);
+      syncLink();
+      linkPart = [field("Firma", inputs.company_id), linkBlock];
+    }
     let dupes = null;
 
     const form = dialogForm(close, async () => {
@@ -311,13 +361,14 @@ async function contactDialog(contact, onSaved, preset = {}) {
     },
       h("div", { class: "form-row" }, field("Vorname", text("first_name")), field("Nachname", text("last_name"))),
       h("div", { class: "dupes-slot" }),
-      field("Firma", inputs.company_id),
-      companyBlock,
+      linkPart,
       h("div", { class: "form-row" },
         field("E-Mail", text("email", { type: "email" })),
         field("Telefon", text("phone", { type: "tel" }))),
       field("Anschrift", text("address")),
+      h("label", { class: "check" }, inputs.private, "Privatkunde (eigene Pipeline, unabhängig von Firmen)"),
       privateBlock,
+      field("Haushalt", h("div", {}, inputs.household, houseList)),
       h("div", { class: "form-row" },
         field("Datenschutz-Grundlage", inputs.consent),
         field("Datenschutz am", text("consent_date", { type: "date" }))),
@@ -325,6 +376,79 @@ async function contactDialog(contact, onSaved, preset = {}) {
     dupes = duplicateWatch("contact", inputs, ["first_name", "last_name", "email", "phone"], contact, close);
     form.querySelector(".dupes-slot").append(dupes.box, dupes.confirmRow);
     return form;
+  });
+}
+
+// Verbindung Person – Firma anlegen oder ändern. Von der Firma aus wird die Person gewählt, sonst die Firma.
+async function linkDialog({ contactId = null, companyId = null, link = null }, onSaved) {
+  const [companies, people] = await Promise.all([
+    contactId && !link ? api("/api/companies") : Promise.resolve([]),
+    companyId && !link ? api("/api/contacts") : Promise.resolve([]),
+  ]);
+  openDialog(link ? "Verbindung ändern" : contactId ? "Mit Firma verbinden" : "Vorhandene Person verbinden", (close) => {
+    const kind = selectEl(meta.linkKinds, link ? link.kind : "Ansprechpartner/in");
+    const role = h("input", { value: link ? link.role : "", placeholder: "zum Beispiel Geschäftsführer" });
+    const primary = h("input", { type: "checkbox", checked: Boolean(link && link.is_primary) });
+    const company = contactId && !link ? selectEl([["", "Bitte wählen"], ...companies.map((o) => [o.id, o.name])], "") : null;
+    const picker = companyId && !link ? personPicker(people) : null;
+    return dialogForm(close, async () => {
+      const body = { kind: kind.value, role: role.value, is_primary: primary.checked };
+      if (link) await api(`/api/links/${link.link_id}`, "PUT", body);
+      else if (contactId) await api(`/api/contacts/${contactId}/companies`, "POST", { ...body, company_id: company.value });
+      else {
+        const person = picker.chosen();
+        if (!person) throw new Error("Bitte eine Person aus der Liste wählen.");
+        await api(`/api/contacts/${person}/companies`, "POST", { ...body, company_id: companyId });
+      }
+      close();
+      onSaved();
+    },
+      company ? field("Firma", company) : null,
+      picker ? field("Person", picker.field) : null,
+      h("div", { class: "form-row" }, field("Rolle", kind), field("Funktion", role)),
+      h("label", { class: "check" }, primary, "Hauptansprechperson dieser Firma"));
+  });
+}
+
+async function relationDialog(c, onSaved) {
+  const people = await api("/api/contacts");
+  openDialog("Verbindung zu einer Person", (close) => {
+    const kind = selectEl(Object.entries(meta.relations), "ehe");
+    const picker = personPicker(people, c.id);
+    const note = h("input", { placeholder: "optional" });
+    return dialogForm(close, async () => {
+      const other = picker.chosen();
+      if (!other) throw new Error("Bitte eine Person aus der Liste wählen.");
+      await api(`/api/contacts/${c.id}/relations`, "POST", { kind: kind.value, other_id: other, note: note.value });
+      close();
+      onSaved();
+    },
+      h("p", { class: "small muted" }, `${personName(c)} ist …`),
+      field("Verbindung", kind),
+      field("Person", picker.field),
+      field("Notiz", note));
+  });
+}
+
+function consentDialog(c, channel, state, onSaved) {
+  const label = meta.channels[channel];
+  openDialog(state === "erteilt" ? `Einwilligung erfassen: ${label}` : `Widerruf erfassen: ${label}`, (close) => {
+    const source = selectEl(meta.consentSources.filter((x) => !x.startsWith("Webseite")), "Persönlich");
+    const when = h("input", { type: "date", value: today(), max: today() });
+    const proof = h("textarea", { rows: 2, placeholder: state === "erteilt"
+      ? "Wie liegt die Einwilligung vor? Zum Beispiel: unterschriebenes Formular vom 12.11., abgelegt im Kundenordner"
+      : "Optional, zum Beispiel: telefonisch widerrufen" });
+    return dialogForm(close, async () => {
+      await api(`/api/contacts/${c.id}/consents`, "POST", { channel, state, source: source.value, date: when.value, proof: proof.value });
+      close();
+      toast(state === "erteilt" ? "Einwilligung gespeichert" : "Widerruf gespeichert");
+      onSaved();
+    },
+      h("p", { class: "small muted" }, state === "erteilt"
+        ? "Eine Einwilligung muss freiwillig, für diesen Zweck und nachweisbar sein. Für Newsletter über die Webseite gilt das Double-Opt-in automatisch."
+        : "Ein Widerruf gilt ab sofort. Der Eintrag bleibt als Nachweis erhalten."),
+      h("div", { class: "form-row" }, field("Wie", source), field("Datum", when)),
+      field("Nachweis", proof));
   });
 }
 
@@ -445,7 +569,7 @@ function taskRow(task, refresh, { owner = false, person = false } = {}) {
       }),
     }),
     h("div", { class: "grow" },
-      h("div", { class: task.done_at ? "done" : "" }, task.title),
+      h("div", { class: task.done_at ? "done" : "" }, task.title, task.area === "privat" || owner ? areaTag(task.area) : null),
       h("div", { class: "small muted" },
         owner ? [ownerLink(task), task.due ? " · " : ""] : null,
         person && task.person ? `${task.person}${task.due ? " · " : ""}` : null,
@@ -456,26 +580,32 @@ function taskRow(task, refresh, { owner = false, person = false } = {}) {
     }, "Löschen"));
 }
 
-function taskSection(path, tasks, refresh, options) {
+function areaSelect(defaultArea) {
+  return selectEl(Object.entries(meta.areas), defaultArea, { "aria-label": "Bereich" });
+}
+
+function taskSection(path, tasks, refresh, options = {}) {
   const title = h("input", { placeholder: "Nächster Schritt", "aria-label": "Aufgabe" });
   const due = h("input", { type: "date", "aria-label": "Fällig am" });
+  const which = options.areaChoice ? areaSelect(options.areaChoice) : null;
   const form = h("form", {
     class: "addform taskadd",
     onsubmit: (e) => {
       e.preventDefault();
       attempt(async () => {
-        await api(`${path}/tasks`, "POST", { title: title.value, due: due.value });
+        await api(`${path}/tasks`, "POST", { title: title.value, due: due.value, area: which ? which.value : "" });
         refresh();
       });
     },
-  }, title, due, h("button", { class: "btn", type: "submit" }, "Anlegen"));
+  }, title, due, which, h("button", { class: "btn", type: "submit" }, "Anlegen"));
   return section("Aufgaben", form,
     tasks.length
       ? h("ul", { class: "rows" }, tasks.map((t) => taskRow(t, refresh, options)))
       : h("p", { class: "empty" }, "Keine Aufgaben."));
 }
 
-function activitySection(path, activities, refresh) {
+function activitySection(path, activities, refresh, options = {}) {
+  const which = options.areaChoice ? areaSelect(options.areaChoice) : null;
   const kind = selectEl(meta.kinds, "Telefonat", { "aria-label": "Art des Eintrags" });
   const when = h("input", { type: "date", value: today(), "aria-label": "Datum des Eintrags" });
   const entry = h("textarea", { rows: 2, placeholder: "Was wurde besprochen?", "aria-label": "Text des Eintrags" });
@@ -484,12 +614,12 @@ function activitySection(path, activities, refresh) {
     onsubmit: (e) => {
       e.preventDefault();
       attempt(async () => {
-        await api(`${path}/activities`, "POST", { kind: kind.value, date: when.value, text: entry.value });
+        await api(`${path}/activities`, "POST", { kind: kind.value, date: when.value, text: entry.value, area: which ? which.value : "" });
         refresh();
       });
     },
   },
-    h("div", { class: "inline" }, kind, when),
+    h("div", { class: "inline" }, kind, when, which),
     entry,
     h("div", { class: "form-end" }, h("button", { class: "btn", type: "submit" }, "Eintrag speichern")));
   return section("Verlauf", form,
@@ -497,7 +627,8 @@ function activitySection(path, activities, refresh) {
       ? h("ul", { class: "rows" }, activities.map((a) => h("li", {},
           h("div", { class: "grow" },
             h("div", { class: "small muted" },
-              [a.kind === "System" ? "Änderung" : a.kind, fmtDate(a.date), a.person].filter(Boolean).join(", ")),
+              [a.kind === "System" ? "Änderung" : a.kind, fmtDate(a.date), a.person].filter(Boolean).join(", "),
+              options.areaChoice ? areaTag(a.area) : null),
             h("p", { class: "prewrap" }, a.text)),
           a.kind === "System" ? null : h("button", {
             class: "iconbtn", type: "button", "aria-label": "Eintrag löschen",
@@ -509,7 +640,7 @@ function activitySection(path, activities, refresh) {
 /* Übersicht */
 
 async function renderOverview(token) {
-  const o = await api("/api/overview");
+  const o = await api(`/api/overview${areaParam()}`);
   if (token !== renderToken) return;
   const refresh = () => route();
   const total = Object.values(o.counts).reduce((a, b) => a + b, 0);
@@ -518,11 +649,12 @@ async function renderOverview(token) {
 
   setView(
     pageHead(new Intl.DateTimeFormat("de-AT", { weekday: "long", day: "numeric", month: "long" }).format(new Date()), "Übersicht"),
+    areaNote(),
     total === 0 ? h("div", { class: "note" }, "Noch keine Einträge vorhanden. Lege oben rechts die erste Firma oder den ersten Kontakt an.") : null,
     o.consentOpen ? h("div", { class: "note" },
       o.consentOpen === 1
-        ? "Bei 1 Kontakt ist die Datenschutz-Grundlage offen oder widerrufen."
-        : `Bei ${o.consentOpen} Kontakten ist die Datenschutz-Grundlage offen oder widerrufen.`) : null,
+        ? "Bei 1 Person ist die Datenschutz-Grundlage offen oder widerrufen."
+        : `Bei ${o.consentOpen} Personen ist die Datenschutz-Grundlage offen oder widerrufen.`) : null,
     h("div", { class: "stats" }, meta.pipeline.map((s) =>
       h("a", { class: "stat", href: "#/pipeline" }, h("b", {}, o.counts[s] || 0), h("span", {}, s)))),
     h("div", { class: "grid2" },
@@ -552,7 +684,7 @@ async function renderOverview(token) {
                   h("div", { class: "small muted" }, `${a.kind}, ${fmtDate(a.date)}`),
                   h("div", {}, a.text)))))
             : h("p", { class: "empty" }, "Noch keine Einträge.")))),
-    dataSection());
+    h("p", { class: "small muted" }, h("a", { href: "#/einstellungen" }, "Einstellungen: Daten übertragen, Schnittstelle für die Webseite")));
 }
 
 /* Daten zwischen Rechnern übertragen: eine Datei mit allen Daten sichern und auf dem anderen Rechner einlesen. */
@@ -705,7 +837,7 @@ async function renderTree(token) {
   }
 
   function personMatches(p, q) {
-    return !q || [personName(p), p.role, p.email, p.phone].some((v) => (v || "").toLowerCase().includes(q));
+    return !q || [personName(p), p.kind, p.role, p.email, p.phone].some((v) => (v || "").toLowerCase().includes(q));
   }
   function companyMatches(c, q) {
     const texts = [c.name, c.industry, c.register_no, c.phone, c.phone2, c.email, c.address].some((v) => (v || "").toLowerCase().includes(q));
@@ -723,7 +855,7 @@ async function renderTree(token) {
     return h("li", { class: "tree-person" },
       personLink(p),
       p.is_primary ? h("span", { class: "tag" }, "Hauptansprechperson") : null,
-      p.role ? h("span", { class: "small muted" }, p.role) : null);
+      h("span", { class: "small muted" }, [p.role || p.kind, p.private ? "auch Privatkunde" : ""].filter(Boolean).join(" · ")));
   }
 
   // Liefert den Knoten einer Firma oder null, wenn weder sie noch eine Tochter zum Filter passt.
@@ -757,12 +889,10 @@ async function renderTree(token) {
     drawPickBar();
     const q = search.value.trim().toLowerCase();
     const roots = sorted(childrenOf.get(0)).map((c) => companyNode(c, q)).filter(Boolean);
-    const firmFilterActive = statusFilter.value || gradeFilter.value || formFilter.value || balanceFilter.value;
     const hits = data.companies.filter((c) => companyMatches(c, q)).length;
     count.textContent = hits === data.companies.length ? `${hits} Firmen` : `${hits} von ${data.companies.length} Firmen`;
-    const privates = firmFilterActive ? [] : data.private.filter((p) => personMatches(p, q));
-    if (!roots.length && !privates.length) {
-      result.replaceChildren(h("p", { class: "empty" }, data.companies.length || data.private.length
+    if (!roots.length) {
+      result.replaceChildren(h("p", { class: "empty" }, data.companies.length
         ? "Nichts gefunden." : "Noch keine Firmen. Lege oben rechts die erste an."));
       return;
     }
@@ -773,7 +903,6 @@ async function renderTree(token) {
           sortHeader("name", "Firma", "tc-name"), sortHeader("ort", "Ort", "tc-ort"),
           sortHeader("status", "Status", "tc-status"), sortHeader("grade", "Einst.", "tc-grade")),
         h("ul", { class: "tree tree-root" }, roots)) : null,
-      privates.length ? section("Privatpersonen", h("ul", { class: "tree tree-root" }, privates.map(personNode))) : null,
     ].filter(Boolean));
   }
 
@@ -1460,7 +1589,7 @@ async function renderCompany(token, id) {
   const deleteCompany = async () => {
     const yes = await confirmDialog(
       "Firma löschen?",
-      `${c.name} wird mit Bilanzen, Verlauf und Aufgaben der Firma gelöscht. Ansprechpartner bleiben als Privatpersonen erhalten, Töchter rücken nach oben.\n\nÄltere Sicherungen enthalten die Firma noch, bis sie durch neuere ersetzt werden.`,
+      `${c.name} wird mit Bilanzen, Verlauf und Aufgaben der Firma gelöscht. Die Personen bleiben im CRM, nur ihre Verbindung zur Firma entfällt. Töchter rücken nach oben.\n\nÄltere Sicherungen enthalten die Firma noch, bis sie durch neuere ersetzt werden.`,
       "Endgültig löschen");
     if (!yes) return;
     await attempt(async () => {
@@ -1470,19 +1599,31 @@ async function renderCompany(token, id) {
     });
   };
 
-  const people = section("Ansprechpartner",
+  const people = section("Personen",
     c.people.length
-      ? h("ul", { class: "rows" }, c.people.map((p) => h("li", {},
+      ? h("ul", { class: "rows links" }, c.people.map((p) => h("li", {},
           h("div", { class: "grow" },
             personLink(p),
             p.is_primary ? h("span", { class: "tag" }, "Hauptansprechperson") : null,
-            h("div", { class: "small muted" }, [p.role, p.phone, p.email].filter(Boolean).join(" · "))))))
-      : h("p", { class: "empty" }, "Noch keine Ansprechpartner."),
+            p.private ? h("span", { class: "tag-area privat" }, "Privatkunde") : null,
+            h("div", { class: "small muted" }, [p.kind, p.role, p.phone, p.email].filter(Boolean).join(" · "))),
+          h("button", { class: "iconbtn plain", type: "button", onclick: () => attempt(() => linkDialog({ link: p }, refresh)) }, "Ändern"),
+          h("button", {
+            class: "iconbtn", type: "button", "aria-label": `Verbindung zu ${personName(p)} lösen`,
+            onclick: () => attempt(async () => {
+              const yes = await confirmDialog("Verbindung lösen?", `${personName(p)} bleibt als Person im CRM, gehört aber nicht mehr zu ${c.name}.`, "Verbindung lösen");
+              if (!yes) return;
+              await api(`/api/links/${p.link_id}`, "DELETE");
+              refresh();
+            }),
+          }, "Lösen"))))
+      : h("p", { class: "empty" }, "Noch keine Personen."),
     h("div", { class: "form-end spaced" },
+      h("button", { class: "btn btn-ghost", type: "button", onclick: () => attempt(() => linkDialog({ companyId: c.id }, refresh)) }, "Vorhandene Person verbinden"),
       h("button", {
         class: "btn btn-ghost", type: "button",
         onclick: () => attempt(() => contactDialog(null, refresh, { company_id: c.id })),
-      }, "Ansprechpartner hinzufügen")));
+      }, "Neue Person")));
 
   const structure = section("Struktur",
     c.parent_id ? h("p", {}, h("span", { class: "muted small" }, "Muttergesellschaft: "), companyLink(c.parent_id, c.parent_name)) : null,
@@ -1539,35 +1680,40 @@ async function renderCompany(token, id) {
 
 /* Kontakte */
 
+function personRows(rows, { privateView = false } = {}) {
+  return h("div", { class: "tablewrap" }, h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", {}, "Name"),
+      privateView ? h("th", {}, "Haushalt") : h("th", {}, "Firmen"),
+      h("th", {}, privateView ? "Ort" : "Privatkunde"),
+      h("th", {}, "Status"),
+      h("th", { class: "hide-sm" }, "E-Mail"), h("th", { class: "hide-sm" }, "Telefon"),
+      h("th", {}, "Nächste Aufgabe"))),
+    h("tbody", {}, rows.map((c) => h("tr", {},
+      h("td", {}, personLink(c), privateView && c.company_names ? h("div", { class: "small muted" }, c.company_names) : null),
+      privateView ? h("td", {}, householdTag(c)) : h("td", {}, c.company_names || "", c.household_id ? h("div", {}, householdTag(c)) : null),
+      h("td", {}, privateView ? placeOf(c.address) : (c.private ? "ja" : "")),
+      h("td", {}, c.private ? badge(c.status) : ""),
+      h("td", { class: "hide-sm" }, c.email ? h("a", { href: `mailto:${c.email}` }, c.email) : ""),
+      h("td", { class: "hide-sm" }, c.phone),
+      h("td", {}, c.next_due
+        ? h("span", { class: c.next_due < today() ? "overdue" : "" }, fmtDate(c.next_due))
+        : (c.open_tasks ? "Ohne Datum" : "")))))));
+}
+
 async function renderContacts(token, params) {
-  const search = h("input", { type: "search", placeholder: "Name, Firma, Funktion, E-Mail, Telefon, Notizen", "aria-label": "Kontakte suchen", value: params.get("q") || "" });
-  const statusFilter = selectEl([["", "Alle Status"], ...meta.statuses], params.get("status") || "", { "aria-label": "Nach Status filtern" });
+  const search = h("input", { type: "search", placeholder: "Name, Firma, Haushalt, E-Mail, Telefon, Notizen", "aria-label": "Personen suchen", value: params.get("q") || "" });
   const results = h("div", {});
+  const count = h("p", { class: "small muted tree-count" });
 
   async function load() {
     const query = new URLSearchParams();
     if (search.value.trim()) query.set("q", search.value.trim());
-    if (statusFilter.value) query.set("status", statusFilter.value);
+    if (area) query.set("bereich", area);
     const rows = await api(`/api/contacts?${query}`);
     if (token !== renderToken) return;
-    results.replaceChildren(rows.length
-      ? h("div", { class: "tablewrap" }, h("table", {},
-          h("thead", {}, h("tr", {},
-            h("th", {}, "Name"), h("th", {}, "Firma"), h("th", {}, "Status"),
-            h("th", { class: "hide-sm" }, "E-Mail"), h("th", { class: "hide-sm" }, "Telefon"),
-            h("th", { class: "hide-sm" }, "Letzter Kontakt"), h("th", {}, "Nächste Aufgabe"))),
-          h("tbody", {}, rows.map((c) => h("tr", {},
-            h("td", {}, personLink(c)),
-            h("td", {}, c.company_id ? companyLink(c.company_id, c.company_name) : "",
-              c.role ? h("div", { class: "small muted" }, c.role) : null),
-            h("td", {}, badge(c.company_status || c.status)),
-            h("td", { class: "hide-sm" }, c.email ? h("a", { href: `mailto:${c.email}` }, c.email) : ""),
-            h("td", { class: "hide-sm" }, c.phone),
-            h("td", { class: "hide-sm" }, fmtDate(c.last_contact)),
-            h("td", {}, c.next_due
-              ? h("span", { class: c.next_due < today() ? "overdue" : "" }, fmtDate(c.next_due))
-              : (c.open_tasks ? "Ohne Datum" : "")))))))
-      : h("p", { class: "empty" }, "Keine Kontakte gefunden."));
+    count.textContent = `${rows.length} Personen`;
+    results.replaceChildren(rows.length ? personRows(rows) : h("p", { class: "empty" }, "Keine Personen gefunden."));
   }
 
   let debounce;
@@ -1575,13 +1721,51 @@ async function renderContacts(token, params) {
     clearTimeout(debounce);
     debounce = setTimeout(() => attempt(load), 200);
   });
-  statusFilter.addEventListener("change", () => attempt(load));
-
   await load();
   if (token !== renderToken) return;
   setView(
-    pageHead("Kontakte", "Alle Personen", h("a", { class: "btn btn-ghost", href: "/api/export.csv" }, "Als CSV exportieren")),
+    pageHead("Personen", area === "firma" ? "Personen mit Firmenbezug" : area === "privat" ? "Privatkunden" : "Alle Personen",
+      h("a", { class: "btn btn-ghost", href: "/api/export.csv" }, "Als CSV exportieren")),
+    areaNote(),
+    h("div", { class: "tools" }, search),
+    count,
+    results);
+}
+
+async function renderPrivate(token, params) {
+  const search = h("input", { type: "search", placeholder: "Name, Haushalt, Ort, E-Mail, Telefon", "aria-label": "Privatkunden suchen", value: params.get("q") || "" });
+  const statusFilter = selectEl([["", "Alle Status"], ...meta.statuses], params.get("status") || "", { "aria-label": "Nach Status filtern" });
+  const household = params.get("haushalt") || "";
+  const results = h("div", {});
+  const count = h("p", { class: "small muted tree-count" });
+
+  async function load() {
+    const query = new URLSearchParams({ bereich: "privat" });
+    if (search.value.trim()) query.set("q", search.value.trim());
+    if (statusFilter.value) query.set("status", statusFilter.value);
+    if (household) query.set("haushalt", household);
+    const rows = await api(`/api/contacts?${query}`);
+    if (token !== renderToken) return rows;
+    count.textContent = `${rows.length} Privatkunden`;
+    results.replaceChildren(rows.length ? personRows(rows, { privateView: true })
+      : h("p", { class: "empty" }, "Keine Privatkunden gefunden. Eine Person wird Privatkunde über „Bearbeiten“ und das Häkchen „Privatkunde“."));
+    return rows;
+  }
+  let debounce;
+  search.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(() => attempt(load), 200); });
+  statusFilter.addEventListener("change", () => attempt(load));
+  const rows = await load();
+  if (token !== renderToken) return;
+  const houseName = household && rows.length ? rows[0].household_name : "";
+  setView(
+    pageHead("Privatkunden", houseName ? `Haushalt ${houseName}` : "Privatkunden und Haushalte",
+      h("button", {
+        class: "btn btn-ghost", type: "button",
+        onclick: () => attempt(() => contactDialog(null, (saved) => { location.hash = `#/kontakt/${saved.id}`; }, { private: true })),
+      }, "Neuer Privatkunde")),
+    household ? h("p", {}, h("a", { href: "#/privatkunden" }, "Alle Privatkunden zeigen")) : null,
     h("div", { class: "tools" }, search, statusFilter),
+    count,
     results);
 }
 
@@ -1589,63 +1773,191 @@ async function renderContact(token, id) {
   const c = await api(`/api/contacts/${id}`);
   if (token !== renderToken) return;
   const refresh = () => route();
-  const shownStatus = c.company_status || c.status;
+  const roles = [c.private ? "Privatkunde" : "", c.companies.length ? "Firmenkontakt" : ""].filter(Boolean).join(" · ") || "Person";
 
-  const statusSelect = c.company_id ? null : selectEl(meta.statuses, c.status, {
-    "aria-label": "Status ändern",
+  const statusSelect = c.private ? selectEl(meta.statuses, c.status, {
+    "aria-label": "Status als Privatkunde ändern",
     onchange: (e) => attempt(async () => {
       await api(`/api/contacts/${c.id}`, "PUT", { status: e.target.value });
       toast(`Status: ${e.target.value}`);
       refresh();
     }),
-  });
+  }) : null;
 
   const deleteContact = async () => {
     const yes = await confirmDialog(
-      "Kontakt löschen?",
-      `${personName(c)} wird mit allen Einträgen und Aufgaben gelöscht. Das lässt sich hier nicht rückgängig machen.\n\nÄltere Sicherungen enthalten den Kontakt noch, bis sie durch neuere ersetzt werden.`,
+      "Person löschen?",
+      `${personName(c)} wird mit allen Einträgen, Aufgaben, Verbindungen und Einwilligungen gelöscht. Das lässt sich hier nicht rückgängig machen.\n\nÄltere Sicherungen enthalten die Person noch, bis sie durch neuere ersetzt werden.`,
       "Endgültig löschen");
     if (!yes) return;
     await attempt(async () => {
       await api(`/api/contacts/${c.id}`, "DELETE");
-      toast("Kontakt gelöscht");
-      location.hash = c.company_id ? `#/firma/${c.company_id}` : "#/kontakte";
+      toast("Person gelöscht");
+      location.hash = c.companies.length ? `#/firma/${c.companies[0].id}` : "#/personen";
     });
   };
 
-  const referrer = !c.company_id && c.source === meta.referralSource && c.referrer_id
+  const referrer = c.private && c.source === meta.referralSource && c.referrer_id
     ? h("a", { href: `#/empfehler/${c.referrer_id}` }, c.referrer_name) : "";
+  const removeButton = (label, path, text) => h("button", {
+    class: "iconbtn", type: "button", "aria-label": label,
+    onclick: () => attempt(async () => {
+      const yes = await confirmDialog(label, text, "Lösen");
+      if (!yes) return;
+      await api(path, "DELETE");
+      refresh();
+    }),
+  }, "Lösen");
 
+  const connections = section("Verbindungen",
+    h("div", { class: "subhead" }, "Firmen"),
+    c.companies.length
+      ? h("ul", { class: "rows links" }, c.companies.map((f) => h("li", {},
+          h("div", { class: "grow" }, companyLink(f.id, f.name),
+            f.is_primary ? h("span", { class: "tag" }, "Hauptansprechperson") : null,
+            h("div", { class: "small muted" }, [f.kind, f.role].filter(Boolean).join(" · "))),
+          badge(f.status),
+          h("button", { class: "iconbtn plain", type: "button", onclick: () => attempt(() => linkDialog({ link: f }, refresh)) }, "Ändern"),
+          removeButton(`Verbindung zu ${f.name} lösen`, `/api/links/${f.link_id}`, `${personName(c)} gehört dann nicht mehr zu ${f.name}. Die Person bleibt erhalten.`))))
+      : h("p", { class: "empty" }, "Mit keiner Firma verbunden."),
+    h("div", { class: "subhead" }, "Haushalt"),
+    c.household_id
+      ? h("div", {}, householdTag(c),
+          c.household_members.length
+            ? h("ul", { class: "rows" }, c.household_members.map((m) => h("li", {},
+                h("div", { class: "grow" }, personLink(m)), m.private ? badge(m.status) : null)))
+            : h("p", { class: "small muted" }, "Noch niemand sonst in diesem Haushalt."))
+      : h("p", { class: "empty" }, "Keinem Haushalt zugeordnet. Über „Bearbeiten“ eintragen."),
+    h("div", { class: "subhead" }, "Personen"),
+    c.relations.length
+      ? h("ul", { class: "rows links" }, c.relations.map((r) => h("li", {},
+          h("div", { class: "grow" }, h("span", { class: "muted" }, `${r.label} `), personLink(r.other),
+            r.note ? h("div", { class: "small muted" }, r.note) : null),
+          removeButton(`Verbindung zu ${personName(r.other)} lösen`, `/api/relations/${r.id}`, "Die Verbindung wird bei beiden Personen entfernt."))))
+      : h("p", { class: "empty" }, "Keine Verbindungen zu anderen Personen."),
+    h("div", { class: "form-end spaced" },
+      h("button", { class: "btn btn-ghost", type: "button", onclick: () => attempt(() => linkDialog({ contactId: c.id }, refresh)) }, "Mit Firma verbinden"),
+      h("button", { class: "btn btn-ghost", type: "button", onclick: () => attempt(() => relationDialog(c, refresh)) }, "Person verbinden")));
+
+  const stateLabel = (state) => h("span", { class: `state-${state || "keine"}` }, meta.consentStates[state || ""]);
+  const consents = section("Werbe-Einwilligungen",
+    h("p", { class: "small muted" }, "Newsletter, Mailings und Werbeanrufe nur mit nachweisbarer Einwilligung. Widerrufe gelten sofort."),
+    h("div", { class: "consent-grid" }, c.consents.channels.map((k) => h("div", { class: "consent-row" },
+      h("div", {}, h("div", {}, k.label),
+        h("div", { class: "small muted" }, stateLabel(k.state), k.since ? ` seit ${fmtDate(k.since.slice(0, 10))}` : "")),
+      k.state === "erteilt"
+        ? h("button", { class: "btn btn-ghost", type: "button", onclick: () => consentDialog(c, k.channel, "widerrufen", refresh) }, "Widerruf erfassen")
+        : h("button", { class: "btn btn-ghost", type: "button", onclick: () => consentDialog(c, k.channel, "erteilt", refresh) }, "Einwilligung erfassen")))),
+    c.consents.events.length ? h("details", {},
+      h("summary", { class: "small" }, `Nachweis (${c.consents.events.length} Einträge)`),
+      h("ul", { class: "rows" }, c.consents.events.map((e) => h("li", {},
+        h("div", { class: "grow" },
+          h("div", { class: "small muted" }, [fmtDate(e.at.slice(0, 10)), meta.channels[e.channel], e.source].filter(Boolean).join(" · ")),
+          h("div", {}, stateLabel(e.state), e.proof ? ` – ${e.proof}` : "")))))) : null);
+
+  const defaultArea = c.companies.length && !c.private ? "firma" : "privat";
   setView(
-    c.company_id
-      ? h("a", { class: "backlink", href: `#/firma/${c.company_id}` }, `Zurück zu ${c.company_name}`)
-      : h("a", { class: "backlink", href: "#/kontakte" }, "Zurück zu allen Personen"),
-    pageHead(shownStatus, personName(c),
+    c.companies.length === 1 && !c.private
+      ? h("a", { class: "backlink", href: `#/firma/${c.companies[0].id}` }, `Zurück zu ${c.companies[0].name}`)
+      : h("a", { class: "backlink", href: c.private ? "#/privatkunden" : "#/personen" }, c.private ? "Zurück zu den Privatkunden" : "Zurück zu allen Personen"),
+    pageHead(c.private ? `${roles} · ${c.status}` : roles, personName(c),
       statusSelect,
       h("button", { class: "btn btn-ghost", type: "button", onclick: () => attempt(() => contactDialog(c, refresh)) }, "Bearbeiten"),
       h("button", { class: "btn btn-danger", type: "button", onclick: deleteContact }, "Löschen")),
     h("div", { class: "detail" },
-      activitySection(`/api/contacts/${c.id}`, c.activities, refresh),
       h("div", { class: "stack" },
-        taskSection(`/api/contacts/${c.id}`, c.tasks, refresh),
+        activitySection(`/api/contacts/${c.id}`, c.activities, refresh, { areaChoice: defaultArea }),
+        connections),
+      h("div", { class: "stack" },
+        taskSection(`/api/contacts/${c.id}`, c.tasks, refresh, { areaChoice: defaultArea }),
         section("Angaben", facts([
-          ["Firma", c.company_id ? companyLink(c.company_id, c.company_name) : ""],
-          ["Funktion", c.role],
           ["E-Mail", c.email ? h("a", { href: `mailto:${c.email}` }, c.email) : ""],
           ["Telefon", telLink(c.phone)],
           ["Anschrift", c.address],
-          ["Quelle", c.company_id ? "" : c.source],
+          ["Privatkunde", c.private ? `ja, ${c.status}` : "nein"],
+          ["Quelle", c.private ? c.source : ""],
           ["Empfohlen von", referrer],
           ["Datenschutz", [c.consent, c.consent_date ? `, ${fmtDate(c.consent_date)}` : ""].join("")],
           ["Angelegt", fmtDate(c.created_at)],
         ])),
+        consents,
         c.notes ? section("Notizen", h("p", { class: "prewrap" }, c.notes)) : null)));
+}
+
+/* Einstellungen: Daten übertragen und Zugänge für die Webseite */
+
+async function renderSettings(token) {
+  const data = await api("/api/apikeys");
+  if (token !== renderToken) return;
+  const refresh = () => route();
+  const newKey = () => openDialog("Neuer Zugang für die Webseite", (close) => {
+    const name = h("input", { placeholder: "zum Beispiel Webseite meerkoetter.at" });
+    const boxes = Object.entries(meta.apiScopes).map(([key, label]) => {
+      const box = h("input", { type: "checkbox", value: key, checked: key === "newsletter" });
+      return { key, box, row: h("label", { class: "check" }, box, label) };
+    });
+    const out = h("div", { hidden: true });
+    const form = dialogForm(close, async () => {
+      const result = await api("/api/apikeys", "POST", { name: name.value, scopes: boxes.filter((b) => b.box.checked).map((b) => b.key) });
+      form.replaceChildren(
+        h("p", {}, "Der Zugangsschlüssel wird nur jetzt angezeigt. Bitte sofort in die Einstellungen der Webseite übernehmen und nirgends sonst ablegen."),
+        h("div", { class: "tokenbox" }, result.token),
+        h("div", { class: "form-end" },
+          h("button", { class: "btn btn-ghost", type: "button", onclick: () => navigator.clipboard?.writeText(result.token).then(() => toast("Kopiert")) }, "Kopieren"),
+          h("button", { class: "btn", type: "button", onclick: () => { close(); refresh(); } }, "Fertig")));
+    },
+      field("Name", name),
+      h("div", {}, h("div", { class: "subhead" }, "Darf"), boxes.map((b) => b.row)),
+      h("p", { class: "small muted" }, "Gib nur frei, was die Webseite braucht. Für Newsletter-Anmeldungen genügt „Newsletter“."),
+      out);
+    return form;
+  });
+
+  setView(
+    pageHead("Einstellungen", "Daten und Schnittstelle"),
+    h("div", { class: "grid2" },
+      h("div", { class: "stack" },
+        dataSection(),
+        section("Hinweise zum Datenschutz",
+          h("ul", { class: "small" },
+            h("li", {}, "Werbe-Einwilligungen werden je Person und Kanal mit Datum, Herkunft und Nachweis gespeichert. Einträge im Nachweis werden nie geändert."),
+            h("li", {}, "Newsletter-Anmeldungen über die Webseite laufen als Double-Opt-in: erst der Klick auf den Bestätigungslink macht daraus eine Einwilligung."),
+            h("li", {}, "Jeder Newsletter braucht den persönlichen Abmeldelink aus der Empfängerliste. Eine Abmeldung wirkt sofort."),
+            h("li", {}, "Rechtliche Fragen (TKG, DSGVO) bitte mit Kammer oder Rechtsberatung klären.")))),
+      h("div", { class: "stack" },
+        section("Schnittstelle für die Webseite",
+          h("p", { class: "small muted" }, "Die Webseite greift über eigene Zugangsschlüssel auf freigegebene Daten zu, zum Beispiel für Newsletter-Anmeldungen. Erreichbar ist die Schnittstelle erst, wenn das CRM zentral auf einem Server läuft. Bis dahin nur auf diesem Rechner."),
+          data.keys.length
+            ? h("ul", { class: "rows" }, data.keys.map((k) => h("li", {},
+                h("div", { class: "grow" },
+                  h("b", {}, k.name), h("span", { class: "small muted" }, ` ${k.prefix}…`),
+                  h("div", { class: "small muted" }, [
+                    `Darf: ${k.scopes.split(",").join(", ")}`,
+                    `angelegt ${fmtDate(k.created_at.slice(0, 10))}`,
+                    k.last_used_at ? `zuletzt genutzt ${fmtDate(k.last_used_at.slice(0, 10))}` : "noch nie genutzt",
+                  ].join(" · ")),
+                  k.revoked_at ? h("div", { class: "small overdue" }, `Gesperrt am ${fmtDate(k.revoked_at.slice(0, 10))}`) : null),
+                k.revoked_at ? null : h("button", {
+                  class: "iconbtn", type: "button",
+                  onclick: () => attempt(async () => {
+                    const yes = await confirmDialog("Zugang sperren?", `Die Webseite kann mit „${k.name}“ danach nicht mehr zugreifen.`, "Sperren");
+                    if (!yes) return;
+                    await api(`/api/apikeys/${k.id}`, "DELETE");
+                    refresh();
+                  }),
+                }, "Sperren"))))
+            : h("p", { class: "empty" }, "Noch kein Zugang angelegt."),
+          h("div", { class: "form-end spaced" }, h("button", { class: "btn btn-ghost", type: "button", onclick: newKey }, "Neuer Zugang"))),
+        data.log.length ? section("Letzte Zugriffe",
+          h("ul", { class: "rows" }, data.log.map((l) => h("li", {},
+            h("div", { class: "grow small" }, `${l.at.replace("T", " ")} · ${l.name || "ohne gültigen Schlüssel"} · ${l.method} ${l.path}`),
+            h("span", { class: `small ${l.status >= 400 ? "overdue" : "muted"}` }, l.status))))) : null)));
 }
 
 /* Pipeline */
 
 async function renderPipeline(token) {
-  const items = await api("/api/pipeline");
+  const items = await api(`/api/pipeline${areaParam()}`);
   if (token !== renderToken) return;
 
   const columns = meta.pipeline.map((status) => {
@@ -1686,6 +1998,7 @@ async function renderPipeline(token) {
   const outside = items.filter((i) => !meta.pipeline.includes(i.status)).length;
   setView(
     pageHead("Pipeline", "Vom Potential zur Kundschaft"),
+    areaNote(),
     h("div", { class: "board" }, columns),
     outside ? h("p", { class: "small muted" }, `${outside} weitere ruhend oder ohne Interesse.`) : null);
 }
@@ -1856,7 +2169,8 @@ function initGlobalSearch() {
     const content = [
       group("Firmen", found.companies, (c) => row(`#/firma/${c.id}`, c.name, [c.address, c.phone].filter(Boolean).join(" · "), badge(c.status))),
       group("Personen", found.people, (p) => row(`#/kontakt/${p.id}`, personName(p),
-        [p.company_name || "Privatperson", p.role].filter(Boolean).join(" · "), badge(p.company_status || p.status))),
+        [p.company_names, p.household_name ? `Haushalt ${p.household_name}` : "", p.private && !p.company_names ? "Privatkunde" : ""].filter(Boolean).join(" · "),
+        p.private ? badge(p.status) : null)),
       group("Empfehler", found.referrers, (r) => row(`#/empfehler/${r.id}`, r.name, [r.phone, r.email].filter(Boolean).join(" · "))),
     ].flat(Infinity).filter(Boolean);
     panel.replaceChildren(...(content.length ? content : [h("p", { class: "search-empty" }, "Nichts gefunden.")]));
@@ -1901,7 +2215,8 @@ async function route() {
   let active = "overview";
   if (path === "/pipeline") active = "pipeline";
   else if (path === "/firmen" || company) active = "companies";
-  else if (path === "/kontakte" || contact) active = "contacts";
+  else if (path === "/privatkunden") active = "private";
+  else if (path === "/personen" || path === "/kontakte" || contact) active = "contacts";
   else if (path === "/empfehler" || referrer) active = "referrers";
   document.querySelectorAll("[data-nav]").forEach((a) => {
     const on = a.dataset.nav === active;
@@ -1913,7 +2228,9 @@ async function route() {
     else if (company) await renderCompany(token, company[1]);
     else if (referrer) await renderReferrer(token, referrer[1]);
     else if (path === "/firmen") await renderTree(token);
-    else if (path === "/kontakte") await renderContacts(token, params);
+    else if (path === "/personen" || path === "/kontakte") await renderContacts(token, params);
+    else if (path === "/privatkunden") await renderPrivate(token, params);
+    else if (path === "/einstellungen") await renderSettings(token);
     else if (path === "/pipeline") await renderPipeline(token);
     else if (path === "/empfehler") await renderReferrers(token);
     else await renderOverview(token);
@@ -1936,6 +2253,7 @@ async function start() {
   document.getElementById("new-company").addEventListener("click", () => attempt(() =>
     companyDialog(null, (saved) => { location.hash = `#/firma/${saved.id}`; })));
   initGlobalSearch();
+  initAreaFilter();
   window.addEventListener("hashchange", () => { route(); window.scrollTo(0, 0); });
   route();
 }

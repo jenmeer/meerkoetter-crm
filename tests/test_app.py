@@ -10,6 +10,7 @@ import socket
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -23,9 +24,11 @@ def free_port():
         return s.getsockname()[1]
 
 
-def call(port, path, data=None, content_type="application/json"):
-    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
-                                     headers={"Content-Type": content_type} if data is not None else {})
+def call(port, path, data=None, content_type="application/json", token=None, method=None):
+    headers = {"Content-Type": content_type} if data is not None else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=180) as res:
         body = res.read()
         return json.loads(body) if res.headers.get_content_type() == "application/json" else body
@@ -100,6 +103,34 @@ def main():
             restored = call(port, "/api/restore", backup, "application/octet-stream")
             assert restored["companies"] == 1, restored
             print("Daten sichern und einlesen: ok")
+
+            # Personen: Firmenkontakt und Privatkunde zugleich, Haushalt, Verbindung
+            body = lambda d: json.dumps(d).encode()
+            person = call(port, "/api/contacts", body({"first_name": "Max", "last_name": "Probe", "company_id": company["id"],
+                                                     "link_kind": "Geschäftsführung", "private": True, "household": "Familie Probe"}))
+            child = call(port, "/api/contacts", body({"first_name": "Lisa", "last_name": "Probe", "private": True, "household": "Familie Probe"}))
+            call(port, f"/api/contacts/{child['id']}/relations", body({"kind": "kind", "other_id": person["id"]}))
+            card = call(port, f"/api/contacts/{person['id']}")
+            assert card["companies"][0]["kind"] == "Geschäftsführung" and card["private"] == 1, card
+            assert card["relations"][0]["label"] == "Elternteil von" and card["household_members"][0]["id"] == child["id"]
+            assert len(call(port, "/api/contacts?bereich=privat")) == 2 and len(call(port, "/api/contacts?bereich=firma")) == 1
+            print("Personen, Haushalt und Verbindungen: ok")
+
+            # Schnittstelle für die Webseite: Double-Opt-in und Abmeldung
+            token = call(port, "/api/apikeys", body({"name": "Test", "scopes": ["newsletter"]}))["token"]
+            signup = call(port, "/v1/newsletter/anmeldung", body({"email": "test@example.com", "consent_text": "Ja, Newsletter"}), token=token)
+            assert call(port, "/v1/newsletter/empfaenger", token=token)["recipients"] == []
+            call(port, "/v1/newsletter/bestaetigung", body({"token": signup["confirm_token"]}), token=token)
+            recipients = call(port, "/v1/newsletter/empfaenger", token=token)["recipients"]
+            assert [r["email"] for r in recipients] == ["test@example.com"], recipients
+            call(port, "/v1/newsletter/abmeldung", body({"token": recipients[0]["unsubscribe_token"]}), token=token)
+            assert call(port, "/v1/newsletter/empfaenger", token=token)["recipients"] == []
+            try:
+                call(port, "/v1/personen", token=token)
+                raise AssertionError("Zugriff ohne Berechtigung war möglich")
+            except urllib.error.HTTPError as err:
+                assert err.code == 403
+            print("Schnittstelle und Einwilligungen: ok")
 
             text = call(port, "/api/pdf", balance_pdf(), "application/pdf")["text"]
             assert "Bilanzstichtag: 31.12.2024" in text and "2.400.000,00" in text, text

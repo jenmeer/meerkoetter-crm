@@ -14,13 +14,19 @@
       <nav class="mainnav" aria-label="Hauptmenü">
         <a href="#/" data-nav="overview">Übersicht</a>
         <a href="#/firmen" data-nav="companies">Firmen</a>
-        <a href="#/kontakte" data-nav="contacts">Kontakte</a>
+        <a href="#/privatkunden" data-nav="private">Privatkunden</a>
+        <a href="#/personen" data-nav="contacts">Personen</a>
         <a href="#/pipeline" data-nav="pipeline">Pipeline</a>
         <a href="#/empfehler" data-nav="referrers">Empfehler</a>
       </nav>
+      <div class="areafilter" id="area-filter" role="group" aria-label="Bereich">
+        <button type="button" data-area="">Alle</button>
+        <button type="button" data-area="firma">Firma</button>
+        <button type="button" data-area="privat">Privat</button>
+      </div>
       <div class="global-search" id="global-search"></div>
       <div class="top-actions">
-        <button class="btn btn-ghost" id="new-contact" type="button">Neuer Kontakt</button>
+        <button class="btn btn-ghost" id="new-contact" type="button">Neue Person</button>
         <button class="btn" id="new-company" type="button">Neue Firma</button>
       </div>
     </div>

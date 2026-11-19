@@ -12,10 +12,31 @@ Nach einer Programmänderung das Terminal-Fenster schließen und neu starten, so
 
 ## Aufbau
 
-- **Firmen:** Baum aus Muttergesellschaft, Töchtern und Ansprechpartnern. Status, Quelle und Empfehler gehören zur Firma, Ansprechpartner übernehmen sie.
-- **Kontakte:** alle Personen. Personen ohne Firma führen Status und Quelle selbst.
-- **Pipeline:** Firmen und Privatpersonen von Potential bis Kunde.
+Jeder Mensch steht genau einmal im CRM. Ob er Ansprechpartner einer Firma, Privatkunde oder beides ist, hängt an seinen Rollen.
+
+- **Firmen:** Baum aus Muttergesellschaft, Töchtern und den verbundenen Personen. Status, Quelle und Empfehler gehören zur Firma.
+- **Privatkunden:** Personen mit dem Häkchen „Privatkunde“. Sie haben eine eigene Pipeline (Status, Quelle, Empfehler), unabhängig von ihren Firmen. Der Haushalt (zum Beispiel „Familie Muster“) ist ein Etikett an der Person; ein Klick darauf zeigt alle Personen des Haushalts.
+- **Personen:** alle Menschen im CRM. Eine Person kann mit mehreren Firmen verbunden sein, jeweils mit Rolle (Geschäftsführung, Gesellschafter/in, Mitarbeiter/in, Begünstigte/r, Ansprechpartner/in) und Funktion.
+- **Verbindungen zwischen Personen:** Ehepartner, Lebensgefährte, Elternteil und Kind, Geschwister, Großeltern und Enkel, Verwandte, Geschäftspartner, Bekannte, Empfehlung. Die Gegenrichtung erscheint automatisch bei der anderen Person.
+- **Bereich Firma oder Privat:** Jeder Verlaufseintrag und jede Aufgabe gehört zu einem Bereich. Der Filter oben in der Leiste (Alle, Firma, Privat) wirkt auf Übersicht, Personen und Pipeline. Private Einträge eines Geschäftsführers erscheinen nicht im Verlauf seiner Firma.
+- **Pipeline:** Firmen und Privatkunden von Potential bis Kunde.
 - **Empfehler:** wer empfohlen hat, was vereinbart ist, welche Provisionen offen oder bezahlt sind. Grundgerüst ohne Berechnung.
+
+## Werbe-Einwilligungen (DSGVO, § 174 TKG)
+
+Auf jeder Personenseite unter „Werbe-Einwilligungen“, je Kanal (Newsletter per E-Mail, Mailings per Post, Anrufe zu Angeboten):
+
+- **Opt-in:** Eine Einwilligung braucht Datum, Herkunft (persönlich, schriftlich, E-Mail, Telefon) und einen Nachweis, etwa „unterschriebenes Formular vom …“. Über die Webseite läuft sie als Double-Opt-in: Anmeldung, dann Klick auf den Bestätigungslink.
+- **Opt-out:** Ein Widerruf gilt sofort. Jeder Newsletter-Empfänger hat einen eigenen Abmeldeschlüssel.
+- **Nachweis:** Jede Änderung wird mit Zeitpunkt angefügt und nie überschrieben.
+
+Das Feld „Datenschutz-Grundlage“ bleibt davon getrennt. Es beschreibt, auf welcher Grundlage die Daten überhaupt verarbeitet werden.
+
+## Schnittstelle für die Webseite
+
+Unter „Einstellungen“ legst du Zugänge für die Webseite an. Jeder Zugang hat eigene Rechte und lässt sich jederzeit sperren. Der Schlüssel wird nur einmal angezeigt, gespeichert ist nur sein Hash. Beschreibung der Aufrufe in README.md.
+
+Erreichbar ist die Schnittstelle erst, wenn das CRM zentral auf einem Server läuft. Solange es nur auf dem Mac läuft, antwortet sie nur dort.
 
 ## Bilanzen aus dem Firmenbuch
 

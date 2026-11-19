@@ -2,11 +2,15 @@
 """Lokales CRM für Jens Meerkötter. Nur Python-Standardbibliothek, nur auf diesem Rechner erreichbar."""
 import argparse
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import threading
+import uuid
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 # In der gebauten App liegen Programmdateien im Paket (PyInstaller), sonst neben server.py.
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 STATIC_DIR = APP_DIR / "static"
@@ -44,7 +48,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # unter Windows kein auf
 IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/heic": ".heic", "image/tiff": ".tiff",
                "image/gif": ".gif", "image/webp": ".webp"}
 BACKUPS_KEPT = 30
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SEARCH_LIMIT = 8  # Treffer je Gruppe in der Ergebnisliste
 QUIET_DAYS = 180  # Kundinnen und Kunden ohne Kontakt seit so vielen Tagen werden gemeldet
 
@@ -58,6 +62,32 @@ LEGAL_FORMS = ["GmbH", "FlexCo", "AG", "GmbH & Co KG", "KG", "OG", "e.U.", "Vere
 GRADES = ["A", "B", "C"]
 COMMISSION_STATES = ["Offen", "Abgerechnet", "Bezahlt"]
 
+# Bereiche: Jede Aktivität und Aufgabe gehört zum Firmen- oder zum Privatgeschäft (für Filter und spätere Reports).
+AREAS = {"firma": "Firma", "privat": "Privat"}
+# Art der Verbindung einer Person zu einer Firma. Eine Person kann an mehreren Firmen hängen.
+LINK_KINDS = ["Geschäftsführung", "Gesellschafter/in", "Mitarbeiter/in", "Begünstigte/r", "Ansprechpartner/in", "Sonstiges"]
+# Verbindungen zwischen Personen: Bezeichnung aus Sicht der ersten Person und Gegenstück aus Sicht der zweiten.
+RELATIONS = {
+    "ehe": ("Ehepartner/in von", "Ehepartner/in von"),
+    "partner": ("Lebensgefährte/-in von", "Lebensgefährte/-in von"),
+    "eltern": ("Elternteil von", "Kind von"),
+    "kind": ("Kind von", "Elternteil von"),
+    "geschwister": ("Geschwister von", "Geschwister von"),
+    "grosseltern": ("Großelternteil von", "Enkelkind von"),
+    "verwandt": ("Verwandt mit", "Verwandt mit"),
+    "geschaeft": ("Geschäftspartner/in von", "Geschäftspartner/in von"),
+    "bekannt": ("Bekannt mit", "Bekannt mit"),
+    "empfohlen": ("Hat empfohlen:", "Empfohlen von"),
+}
+# Werbe-Einwilligungen nach DSGVO und § 174 TKG: je Person und Kanal ein Stand, jede Änderung als Nachweis protokolliert.
+CHANNELS = {"newsletter": "Newsletter per E-Mail", "post": "Mailings per Post", "telefon": "Anrufe zu Angeboten"}
+CONSENT_STATES = {"": "Keine Angabe", "ausstehend": "Bestätigung ausstehend", "erteilt": "Erteilt", "widerrufen": "Widerrufen"}
+CONSENT_SOURCES = ["Persönlich", "Schriftlich", "E-Mail", "Telefon", "Webseite (Double-Opt-in)", "Sonstiges"]
+API_SCOPES = {"newsletter": "Newsletter: Anmeldung, Bestätigung, Abmeldung, Empfängerliste",
+              "lesen": "Lesen: Personen und Firmen (Grunddaten)"}
+OPTIN_DAYS = 7  # so lange gilt der Bestätigungslink einer Newsletter-Anmeldung
+API_LOG_KEPT = 5000
+
 # Bewertung der Bilanz: Vorschlag, alle Schwellen lassen sich hier ändern.
 RATING = {
     "investable": [(500_000, 3), (150_000, 2), (50_000, 1)],  # liquide Mittel + Wertpapiere in Euro, Punkte
@@ -70,7 +100,7 @@ RATING = {
 }
 
 PERSON_FIELDS = [
-    "first_name", "last_name", "email", "phone", "address", "role",
+    "first_name", "last_name", "email", "phone", "address",
     "source", "status", "consent", "consent_date", "notes",
 ]
 COMPANY_FIELDS = [
@@ -312,6 +342,134 @@ def migrate_v3(conn):
                          [*found.values(), "\n".join(kept), row["id"]])
 
 
+MIGRATION_V4 = [
+    """CREATE TABLE households (
+        id INTEGER PRIMARY KEY,
+        uid TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE contacts_new (
+        id INTEGER PRIMARY KEY,
+        uid TEXT NOT NULL UNIQUE,
+        first_name TEXT NOT NULL DEFAULT '',
+        last_name TEXT NOT NULL DEFAULT '',
+        email TEXT NOT NULL DEFAULT '',
+        phone TEXT NOT NULL DEFAULT '',
+        address TEXT NOT NULL DEFAULT '',
+        private INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'Potential',
+        source TEXT NOT NULL DEFAULT '',
+        referrer_id INTEGER REFERENCES referrers(id) ON DELETE SET NULL,
+        household_id INTEGER REFERENCES households(id) ON DELETE SET NULL,
+        consent TEXT NOT NULL DEFAULT 'Offen',
+        consent_date TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE affiliations (
+        id INTEGER PRIMARY KEY,
+        contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL DEFAULT 'Ansprechpartner/in',
+        role TEXT NOT NULL DEFAULT '',
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE (contact_id, company_id)
+    )""",
+    """INSERT INTO affiliations (contact_id, company_id, role, is_primary, created_at)
+        SELECT id, company_id, role, is_primary, created_at FROM contacts WHERE company_id IS NOT NULL""",
+    """INSERT INTO contacts_new (id, uid, first_name, last_name, email, phone, address, private, status, source,
+        referrer_id, consent, consent_date, notes, created_at, updated_at)
+        SELECT id, lower(hex(randomblob(16))), first_name, last_name, email, phone, address, company_id IS NULL,
+        status, CASE WHEN company_id IS NULL THEN source ELSE '' END,
+        CASE WHEN company_id IS NULL THEN referrer_id END, consent, consent_date, notes, created_at, updated_at
+        FROM contacts""",
+    "DROP TABLE contacts",
+    "ALTER TABLE contacts_new RENAME TO contacts",
+    """CREATE TABLE relations (
+        id INTEGER PRIMARY KEY,
+        a_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        b_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        UNIQUE (a_id, b_id, kind),
+        CHECK (a_id != b_id)
+    )""",
+    """CREATE TABLE consents (
+        id INTEGER PRIMARY KEY,
+        contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL,
+        state TEXT NOT NULL,
+        since TEXT NOT NULL,
+        optin_hash TEXT NOT NULL DEFAULT '',
+        optin_expires TEXT NOT NULL DEFAULT '',
+        unsubscribe_token TEXT NOT NULL DEFAULT '',
+        UNIQUE (contact_id, channel)
+    )""",
+    # Nachweis nach Art. 7 Abs. 1 DSGVO: Einträge werden nur angefügt, nie geändert.
+    """CREATE TABLE consent_events (
+        id INTEGER PRIMARY KEY,
+        contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL,
+        state TEXT NOT NULL,
+        at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        proof TEXT NOT NULL DEFAULT '',
+        recorded_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE api_keys (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        prefix TEXT NOT NULL,
+        secret_hash TEXT NOT NULL UNIQUE,
+        scopes TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT NOT NULL DEFAULT '',
+        revoked_at TEXT NOT NULL DEFAULT ''
+    )""",
+    """CREATE TABLE api_log (
+        id INTEGER PRIMARY KEY,
+        at TEXT NOT NULL,
+        key_id INTEGER,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        status INTEGER NOT NULL
+    )""",
+    "ALTER TABLE companies ADD COLUMN uid TEXT",
+    "UPDATE companies SET uid = lower(hex(randomblob(16)))",
+    "CREATE UNIQUE INDEX idx_companies_uid ON companies(uid)",
+    "ALTER TABLE activities ADD COLUMN area TEXT NOT NULL DEFAULT 'firma'",
+    "ALTER TABLE tasks ADD COLUMN area TEXT NOT NULL DEFAULT 'firma'",
+    """UPDATE activities SET area = 'privat' WHERE contact_id IN (SELECT id FROM contacts WHERE private = 1)
+        AND contact_id NOT IN (SELECT contact_id FROM affiliations)""",
+    """UPDATE tasks SET area = 'privat' WHERE contact_id IN (SELECT id FROM contacts WHERE private = 1)
+        AND contact_id NOT IN (SELECT contact_id FROM affiliations)""",
+    "CREATE INDEX idx_affiliations_company ON affiliations(company_id)",
+    "CREATE INDEX idx_affiliations_contact ON affiliations(contact_id)",
+    "CREATE INDEX idx_contacts_household ON contacts(household_id)",
+    "CREATE INDEX idx_relations_a ON relations(a_id)",
+    "CREATE INDEX idx_relations_b ON relations(b_id)",
+    "CREATE INDEX idx_consent_events_contact ON consent_events(contact_id, at)",
+    "CREATE INDEX idx_activities_contact ON activities(contact_id, date)",
+]
+
+
+def migrate_v4(conn):
+    """Personen getrennt von Firmen: mehrere Firmen je Person, Privatkunden, Haushalt, Verbindungen,
+    Werbe-Einwilligungen, Zugänge für die Schnittstelle und eindeutige Kennungen für eine spätere Synchronisierung."""
+    conn.execute("DROP INDEX IF EXISTS idx_contacts_company")
+    conn.execute("DROP INDEX IF EXISTS idx_activities_contact")
+    for statement in MIGRATION_V4:
+        conn.execute(statement)
+    # Schutz vor stillen Fehlern beim Umbau: Jeder Bezug muss noch auf einen vorhandenen Eintrag zeigen.
+    broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if broken:
+        raise RuntimeError(f"Umbau abgebrochen, {len(broken)} ungültige Bezüge")
+
+
 class Database:
     def __init__(self, path):
         self.path = path
@@ -348,7 +506,10 @@ class Database:
             try:
                 if version < 2:
                     migrate_v2(conn)
-                migrate_v3(conn)
+                if version < 3:
+                    migrate_v3(conn)
+                if version < 4:
+                    migrate_v4(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except Exception:
@@ -664,13 +825,22 @@ COMPANY_SELECT = (
     "FROM companies co LEFT JOIN referrers r ON r.id = co.referrer_id "
     "LEFT JOIN companies p ON p.id = co.parent_id"
 )
+CONTACT_COMPANIES = (
+    "(SELECT GROUP_CONCAT(co.name, ' · ') FROM affiliations f JOIN companies co ON co.id = f.company_id "
+    "WHERE f.contact_id = c.id)"
+)
 CONTACT_SELECT = (
-    "SELECT c.*, co.name AS company_name, co.status AS company_status, r.name AS referrer_name, "
+    f"SELECT c.*, r.name AS referrer_name, hh.name AS household_name, {CONTACT_COMPANIES} AS company_names, "
+    "(SELECT COUNT(*) FROM affiliations f WHERE f.contact_id = c.id) AS company_count, "
     "(SELECT MAX(a.date) FROM activities a WHERE a.contact_id = c.id AND a.kind != 'System') AS last_contact, "
     "(SELECT COUNT(*) FROM tasks t WHERE t.contact_id = c.id AND t.done_at = '') AS open_tasks, "
     "(SELECT MIN(t.due) FROM tasks t WHERE t.contact_id = c.id AND t.done_at = '' AND t.due != '') AS next_due "
-    "FROM contacts c LEFT JOIN companies co ON co.id = c.company_id "
-    "LEFT JOIN referrers r ON r.id = c.referrer_id"
+    "FROM contacts c LEFT JOIN referrers r ON r.id = c.referrer_id "
+    "LEFT JOIN households hh ON hh.id = c.household_id"
+)
+AFFILIATION_SELECT = (
+    "SELECT f.id AS link_id, f.kind, f.role, f.is_primary, c.id, c.first_name, c.last_name, c.email, c.phone, "
+    "c.private, c.status FROM affiliations f JOIN contacts c ON c.id = f.contact_id"
 )
 FREE_MAIL = {"gmx.at", "gmx.net", "gmx.de", "gmx.com", "aon.at", "gmail.com", "googlemail.com", "a1.net", "chello.at",
              "utanet.at", "hotmail.com", "hotmail.de", "hotmail.at", "yahoo.com", "yahoo.de", "yahoo.at", "outlook.com",
@@ -774,6 +944,9 @@ class Api:
             "statuses": STATUSES, "pipeline": PIPELINE, "kinds": KINDS, "sources": SOURCES,
             "referralSource": REFERRAL_SOURCE, "consents": CONSENTS, "legalForms": LEGAL_FORMS,
             "grades": GRADES, "commissionStates": COMMISSION_STATES, "quietDays": QUIET_DAYS,
+            "areas": AREAS, "linkKinds": LINK_KINDS, "channels": CHANNELS, "consentStates": CONSENT_STATES,
+            "consentSources": CONSENT_SOURCES, "apiScopes": API_SCOPES,
+            "relations": {k: v[0] for k, v in RELATIONS.items()},
             "rating": RATING, "today": date.today().isoformat(), "version": VERSION, "platform": sys.platform,
         }
 
@@ -801,7 +974,8 @@ class Api:
             if field in data:
                 merged[field] = text_field(data[field], field)
             merged.setdefault(field, "")
-        merged["status"] = merged["status"] or "Neu"
+        merged["private"] = 1 if data.get("private", (base or {}).get("private")) else 0
+        merged["status"] = merged["status"] or "Potential"
         merged["consent"] = merged["consent"] or "Offen"
         if not (merged["first_name"] or merged["last_name"]):
             raise ApiError(400, "Bitte einen Vor- oder Nachnamen angeben. Firmen legst du unter Firmen an.")
@@ -811,14 +985,31 @@ class Api:
             raise ApiError(400, "Datenschutz-Angabe ungültig.")
         valid_email(merged["email"])
         merged["consent_date"] = valid_date(merged["consent_date"], "Datenschutz am")
-        company_id = optional_id(data.get("company_id", (base or {}).get("company_id")), "Firma")
-        if company_id is not None:
-            self.require(conn, "companies", company_id, "Firma nicht gefunden.")
-        merged["company_id"] = company_id
-        merged["is_primary"] = 1 if data.get("is_primary", (base or {}).get("is_primary")) and company_id else 0
         referrer_id = optional_id(data.get("referrer_id", (base or {}).get("referrer_id")), "Empfehler")
         merged["referrer_id"] = self.referral_fields(conn, merged["source"], referrer_id)
+        # Haushalt über den Namen: vorhandenen nehmen oder neu anlegen, leer heißt kein Haushalt.
+        if "household" in data:
+            merged["household_id"] = self.household_id(conn, text_field(data["household"], "household"))
+        else:
+            merged.setdefault("household_id", None)
         return merged
+
+    @staticmethod
+    def household_id(conn, name):
+        name = re.sub(r"\s+", " ", name or "").strip()
+        if not name:
+            return None
+        if len(name) > 120:
+            raise ApiError(400, "Haushalt: Name zu lang.")
+        row = conn.execute("SELECT id FROM households WHERE fold(name) = ?", (fold(name),)).fetchone()
+        if row:
+            return row["id"]
+        return conn.execute("INSERT INTO households (uid, name, created_at) VALUES (?, ?, ?)",
+                            (uuid.uuid4().hex, name, now())).lastrowid
+
+    @staticmethod
+    def drop_empty_households(conn):
+        conn.execute("DELETE FROM households WHERE id NOT IN (SELECT household_id FROM contacts WHERE household_id IS NOT NULL)")
 
     def clean_company(self, conn, data, base=None, company_id=None):
         merged = dict(base) if base else {}
@@ -878,19 +1069,29 @@ class Api:
     def list_contacts(self, query):
         q = query.get("q", [""])[0].strip()
         status = query.get("status", [""])[0]
+        area = query.get("bereich", [""])[0]
+        household = query.get("haushalt", [""])[0]
         sql, where, args = CONTACT_SELECT, [], []
         if q:
             pattern = like_pattern(q)
             where.append(
                 "(fold(c.first_name || ' ' || c.last_name) LIKE ? ESCAPE '\\' "
                 "OR fold(c.last_name || ' ' || c.first_name) LIKE ? ESCAPE '\\' "
-                "OR fold(COALESCE(co.name, '')) LIKE ? ESCAPE '\\' OR fold(c.role) LIKE ? ESCAPE '\\' "
+                f"OR fold(COALESCE({CONTACT_COMPANIES}, '')) LIKE ? ESCAPE '\\' "
+                "OR fold(COALESCE(hh.name, '')) LIKE ? ESCAPE '\\' OR fold(c.address) LIKE ? ESCAPE '\\' "
                 "OR fold(c.email) LIKE ? ESCAPE '\\' OR fold(c.phone) LIKE ? ESCAPE '\\' "
                 "OR fold(c.notes) LIKE ? ESCAPE '\\')")
-            args += [pattern] * 7
+            args += [pattern] * 8
+        if area == "privat":
+            where.append("c.private = 1")
+        elif area == "firma":
+            where.append("EXISTS (SELECT 1 FROM affiliations f WHERE f.contact_id = c.id)")
         if status:
-            where.append("COALESCE(co.status, c.status) = ?")
+            where.append("c.private = 1 AND c.status = ?")
             args.append(status)
+        if household:
+            where.append("c.household_id = ?")
+            args.append(optional_id(household, "Haushalt"))
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY fold(c.last_name), fold(c.first_name)"
@@ -904,6 +1105,16 @@ class Api:
         conn = self.db.connect()
         try:
             contact = self.contact_row(conn, contact_id)
+            contact["companies"] = [dict(r) for r in conn.execute(
+                "SELECT f.id AS link_id, f.kind, f.role, f.is_primary, co.id, co.name, co.status "
+                "FROM affiliations f JOIN companies co ON co.id = f.company_id WHERE f.contact_id = ? "
+                "ORDER BY fold(co.name)", (contact_id,))]
+            contact["household_members"] = [dict(r) for r in conn.execute(
+                "SELECT id, first_name, last_name, private, status FROM contacts "
+                "WHERE household_id = ? AND id != ? ORDER BY fold(last_name), fold(first_name)",
+                (contact["household_id"], contact_id))] if contact["household_id"] else []
+            contact["relations"] = self.relations_of(conn, contact_id)
+            contact["consents"] = self.consents_of(conn, contact_id)
             contact["activities"] = [dict(r) for r in conn.execute(
                 "SELECT * FROM activities WHERE contact_id = ? ORDER BY date DESC, id DESC", (contact_id,))]
             contact["tasks"] = [dict(r) for r in conn.execute(
@@ -914,28 +1125,29 @@ class Api:
 
     def write_contact(self, conn, c, contact_id=None):
         stamp = now()
-        fields = PERSON_FIELDS + ["company_id", "is_primary", "referrer_id"]
+        fields = PERSON_FIELDS + ["private", "referrer_id", "household_id"]
         values = [c[f] for f in fields]
         if contact_id is None:
-            cols = fields + ["created_at", "updated_at"]
+            cols = ["uid"] + fields + ["created_at", "updated_at"]
             cur = conn.execute(
                 f"INSERT INTO contacts ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-                values + [stamp, stamp])
+                [uuid.uuid4().hex] + values + [stamp, stamp])
             contact_id = cur.lastrowid
         else:
             sets = ", ".join(f"{f} = ?" for f in fields)
             conn.execute(f"UPDATE contacts SET {sets}, updated_at = ? WHERE id = ?", values + [stamp, contact_id])
-        if c["is_primary"]:
-            conn.execute("UPDATE contacts SET is_primary = 0 WHERE company_id = ? AND id != ?",
-                         (c["company_id"], contact_id))
+        self.drop_empty_households(conn)
         return contact_id
 
     def create_contact(self, data):
         conn = self.db.connect()
         try:
             c = self.clean_person(conn, data)
+            link = self.clean_link(conn, data) if data.get("company_id") not in (None, "") else None
             with conn:
                 contact_id = self.write_contact(conn, c)
+                if link:
+                    self.write_link(conn, contact_id, link)
             return self.contact_row(conn, contact_id)
         finally:
             conn.close()
@@ -947,17 +1159,127 @@ class Api:
             c = self.clean_person(conn, data, base)
             with conn:
                 self.write_contact(conn, c, contact_id)
-                if base["status"] != c["status"] and not c["company_id"]:
-                    self.log_status(conn, "contact_id", contact_id, base["status"], c["status"])
+                if c["private"] and base["private"] and base["status"] != c["status"]:
+                    self.log_status(conn, "contact_id", contact_id, base["status"], c["status"], "privat")
+                elif c["private"] != base["private"]:
+                    text = "Als Privatkunde geführt" if c["private"] else "Nicht mehr als Privatkunde geführt"
+                    conn.execute("INSERT INTO activities (contact_id, kind, date, text, area, created_at) "
+                                 "VALUES (?, 'System', ?, ?, 'privat', ?)", (contact_id, date.today().isoformat(), text, now()))
             return self.contact_row(conn, contact_id)
         finally:
             conn.close()
 
+    def list_households(self):
+        conn = self.db.connect()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT hh.id, hh.name, COUNT(c.id) AS members FROM households hh "
+                "LEFT JOIN contacts c ON c.household_id = hh.id GROUP BY hh.id ORDER BY fold(hh.name)")]
+        finally:
+            conn.close()
+
+    # Verbindungen Person – Firma
+
+    def clean_link(self, conn, data):
+        company_id = optional_id(data.get("company_id"), "Firma")
+        if company_id is None:
+            raise ApiError(400, "Bitte eine Firma wählen.")
+        self.require(conn, "companies", company_id, "Firma nicht gefunden.")
+        kind = text_field(data.get("link_kind", data.get("kind", "")) or "Ansprechpartner/in", "kind")
+        if kind not in LINK_KINDS:
+            raise ApiError(400, "Art der Verbindung ungültig.")
+        return {"company_id": company_id, "kind": kind, "role": text_field(data.get("role", ""), "role"),
+                "is_primary": 1 if data.get("is_primary") else 0}
+
     @staticmethod
-    def log_status(conn, column, row_id, old, new):
+    def write_link(conn, contact_id, link, link_id=None):
+        if link_id is None:
+            try:
+                link_id = conn.execute(
+                    "INSERT INTO affiliations (contact_id, company_id, kind, role, is_primary, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (contact_id, link["company_id"], link["kind"], link["role"], link["is_primary"], now())).lastrowid
+            except sqlite3.IntegrityError:
+                raise ApiError(409, "Diese Person ist mit der Firma schon verbunden.")
+        else:
+            conn.execute("UPDATE affiliations SET kind = ?, role = ?, is_primary = ? WHERE id = ?",
+                         (link["kind"], link["role"], link["is_primary"], link_id))
+        if link["is_primary"]:
+            conn.execute("UPDATE affiliations SET is_primary = 0 WHERE company_id = ? AND id != ?",
+                         (link["company_id"], link_id))
+        return link_id
+
+    def add_link(self, contact_id, data):
+        conn = self.db.connect()
+        try:
+            self.require(conn, "contacts", contact_id, "Kontakt nicht gefunden.")
+            link = self.clean_link(conn, data)
+            with conn:
+                self.write_link(conn, contact_id, link)
+            return {"ok": True}
+        finally:
+            conn.close()
+
+    def update_link(self, link_id, data):
+        conn = self.db.connect()
+        try:
+            row = self.require(conn, "affiliations", link_id, "Verbindung nicht gefunden.")
+            link = self.clean_link(conn, {**data, "company_id": row["company_id"]})
+            with conn:
+                self.write_link(conn, row["contact_id"], link, link_id)
+            return {"ok": True}
+        finally:
+            conn.close()
+
+    # Verbindungen zwischen Personen
+
+    @staticmethod
+    def relations_of(conn, contact_id):
+        rows = conn.execute(
+            "SELECT r.id, r.kind, r.note, r.a_id, r.b_id, a.first_name AS a_first, a.last_name AS a_last, "
+            "b.first_name AS b_first, b.last_name AS b_last FROM relations r "
+            "JOIN contacts a ON a.id = r.a_id JOIN contacts b ON b.id = r.b_id "
+            "WHERE r.a_id = ? OR r.b_id = ?", (contact_id, contact_id)).fetchall()
+        out = []
+        for r in rows:
+            mine = r["a_id"] == contact_id
+            label = RELATIONS.get(r["kind"], (r["kind"], r["kind"]))[0 if mine else 1]
+            other = {"id": r["b_id"], "first_name": r["b_first"], "last_name": r["b_last"]} if mine else \
+                    {"id": r["a_id"], "first_name": r["a_first"], "last_name": r["a_last"]}
+            out.append({"id": r["id"], "label": label, "note": r["note"], "other": other})
+        return sorted(out, key=lambda x: (x["label"], fold(person_name(x["other"]))))
+
+    def add_relation(self, contact_id, data):
+        kind = text_field(data.get("kind", ""), "kind")
+        if kind not in RELATIONS:
+            raise ApiError(400, "Art der Verbindung ungültig.")
+        other = optional_id(data.get("other_id"), "Person")
+        if other is None:
+            raise ApiError(400, "Bitte eine Person wählen.")
+        if other == contact_id:
+            raise ApiError(400, "Eine Person kann nicht mit sich selbst verbunden werden.")
+        conn = self.db.connect()
+        try:
+            self.require(conn, "contacts", contact_id, "Kontakt nicht gefunden.")
+            self.require(conn, "contacts", other, "Person nicht gefunden.")
+            # „Kind von“ wird als „Elternteil von“ in Gegenrichtung gespeichert, damit es nur eine Form gibt.
+            a, b = (other, contact_id) if kind == "kind" else (contact_id, other)
+            kind = "eltern" if kind == "kind" else kind
+            try:
+                with conn:
+                    conn.execute("INSERT INTO relations (a_id, b_id, kind, note, created_at) VALUES (?, ?, ?, ?, ?)",
+                                 (a, b, kind, text_field(data.get("note", ""), "note"), now()))
+            except sqlite3.IntegrityError:
+                raise ApiError(409, "Diese Verbindung gibt es schon.")
+            return {"ok": True}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def log_status(conn, column, row_id, old, new, area="firma"):
         conn.execute(
-            f"INSERT INTO activities ({column}, kind, date, text, created_at) VALUES (?, 'System', ?, ?, ?)",
-            (row_id, date.today().isoformat(), f"Status: {old} → {new}", now()))
+            f"INSERT INTO activities ({column}, kind, date, text, area, created_at) VALUES (?, 'System', ?, ?, ?, ?)",
+            (row_id, date.today().isoformat(), f"Status: {old} → {new}", area, now()))
 
     def delete_row(self, table, row_id, message="Eintrag nicht gefunden."):
         conn = self.db.connect()
@@ -989,7 +1311,8 @@ class Api:
         conn = self.db.connect()
         try:
             people = [dict(r) for r in conn.execute(
-                f"{CONTACT_SELECT} ORDER BY c.is_primary DESC, fold(c.last_name), fold(c.first_name)")]
+                f"{AFFILIATION_SELECT.replace('SELECT ', 'SELECT f.company_id, ', 1)} "
+                "ORDER BY f.is_primary DESC, fold(c.last_name), fold(c.first_name)")]
         finally:
             conn.close()
         by_company = {}
@@ -997,7 +1320,7 @@ class Api:
             by_company.setdefault(person["company_id"], []).append(person)
         for company in companies:
             company["people"] = by_company.get(company["id"], [])
-        return {"companies": companies, "private": by_company.get(None, [])}
+        return {"companies": companies}
 
     def get_company(self, company_id):
         conn = self.db.connect()
@@ -1005,20 +1328,22 @@ class Api:
             company = self.company_row(conn, company_id)
             company["financials"] = self.financials_of(conn, company_id)
             company["people"] = [dict(r) for r in conn.execute(
-                f"{CONTACT_SELECT} WHERE c.company_id = ? "
-                "ORDER BY c.is_primary DESC, fold(c.last_name), fold(c.first_name)", (company_id,))]
+                f"{AFFILIATION_SELECT} WHERE f.company_id = ? "
+                "ORDER BY f.is_primary DESC, fold(c.last_name), fold(c.first_name)", (company_id,))]
             company["children"] = [dict(r) for r in conn.execute(
                 "SELECT id, name, status FROM companies WHERE parent_id = ? ORDER BY fold(name)", (company_id,))]
             person_label = "c.first_name || ' ' || c.last_name"
             company["activities"] = [dict(r) for r in conn.execute(
                 f"SELECT a.*, TRIM({person_label}) AS person FROM activities a "
                 "LEFT JOIN contacts c ON c.id = a.contact_id "
-                "WHERE a.company_id = ? OR c.company_id = ? ORDER BY a.date DESC, a.id DESC",
+                "WHERE a.company_id = ? OR (a.area = 'firma' AND a.contact_id IN "
+                "(SELECT contact_id FROM affiliations WHERE company_id = ?)) ORDER BY a.date DESC, a.id DESC",
                 (company_id, company_id))]
             company["tasks"] = [dict(r) for r in conn.execute(
                 f"SELECT t.*, TRIM({person_label}) AS person FROM tasks t "
                 "LEFT JOIN contacts c ON c.id = t.contact_id "
-                "WHERE t.company_id = ? OR c.company_id = ? "
+                "WHERE t.company_id = ? OR (t.area = 'firma' AND t.contact_id IN "
+                "(SELECT contact_id FROM affiliations WHERE company_id = ?)) "
                 "ORDER BY t.done_at != '', t.due = '', t.due, t.id", (company_id, company_id))]
             return company
         finally:
@@ -1030,11 +1355,11 @@ class Api:
             c = self.clean_company(conn, data)
             stamp = now()
             fields = COMPANY_FIELDS + ["parent_id", "referrer_id"]
-            cols = fields + ["created_at", "updated_at"]
+            cols = ["uid"] + fields + ["created_at", "updated_at"]
             with conn:
                 cur = conn.execute(
                     f"INSERT INTO companies ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-                    [c[f] for f in fields] + [stamp, stamp])
+                    [uuid.uuid4().hex] + [c[f] for f in fields] + [stamp, stamp])
             return self.company_row(conn, cur.lastrowid)
         finally:
             conn.close()
@@ -1058,12 +1383,9 @@ class Api:
     def delete_company(self, company_id):
         conn = self.db.connect()
         try:
-            company = self.require(conn, "companies", company_id, "Firma nicht gefunden.")
+            self.require(conn, "companies", company_id, "Firma nicht gefunden.")
             with conn:
-                # Ansprechpartner bleiben als Privatpersonen erhalten und übernehmen den Status der Firma.
-                conn.execute("UPDATE contacts SET status = ?, source = ?, referrer_id = ?, is_primary = 0 "
-                             "WHERE company_id = ?",
-                             (company["status"], company["source"], company["referrer_id"], company_id))
+                # Personen bleiben erhalten, nur ihre Verbindung zu dieser Firma entfällt.
                 conn.execute("DELETE FROM companies WHERE id = ?", (company_id,))
             return {"ok": True}
         finally:
@@ -1131,14 +1453,13 @@ class Api:
             raise ApiError(400, "Art ungültig.")
         text = body_text(data, "text", "einen Text")
         when = valid_date(body_text(data, "date", "ein Datum"), "Datum")
-        table = "contacts" if column == "contact_id" else "companies"
         conn = self.db.connect()
         try:
-            self.require(conn, table, owner_id, "Eintrag nicht gefunden.")
+            area = self.area_for(conn, column, owner_id, data)
             with conn:
                 conn.execute(
-                    f"INSERT INTO activities ({column}, kind, date, text, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (owner_id, kind, when, text, now()))
+                    f"INSERT INTO activities ({column}, kind, date, text, area, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (owner_id, kind, when, text, area, now()))
             return {"ok": True}
         finally:
             conn.close()
@@ -1146,16 +1467,29 @@ class Api:
     def add_task(self, column, owner_id, data):
         title = body_text(data, "title", "eine Aufgabe")
         due = valid_date(body_text(data, "due", "ein Datum", required=False), "Fällig am")
-        table = "contacts" if column == "contact_id" else "companies"
         conn = self.db.connect()
         try:
-            self.require(conn, table, owner_id, "Eintrag nicht gefunden.")
+            area = self.area_for(conn, column, owner_id, data)
             with conn:
-                conn.execute(f"INSERT INTO tasks ({column}, title, due, created_at) VALUES (?, ?, ?, ?)",
-                             (owner_id, title, due, now()))
+                conn.execute(f"INSERT INTO tasks ({column}, title, due, area, created_at) VALUES (?, ?, ?, ?, ?)",
+                             (owner_id, title, due, area, now()))
             return {"ok": True}
         finally:
             conn.close()
+
+    def area_for(self, conn, column, owner_id, data):
+        """Bereich eines Eintrags: bei Firmen immer Firma, bei Personen gewählt oder aus ihren Rollen abgeleitet."""
+        if column == "company_id":
+            self.require(conn, "companies", owner_id, "Firma nicht gefunden.")
+            return "firma"
+        person = self.require(conn, "contacts", owner_id, "Kontakt nicht gefunden.")
+        area = data.get("area") or ""
+        if area:
+            if area not in AREAS:
+                raise ApiError(400, "Bereich ungültig.")
+            return area
+        linked = conn.execute("SELECT 1 FROM affiliations WHERE contact_id = ?", (owner_id,)).fetchone()
+        return "firma" if linked and not person["private"] else "privat"
 
     def update_task(self, task_id, data):
         done = data.get("done")
@@ -1168,6 +1502,244 @@ class Api:
                 if cur.rowcount == 0:
                     raise ApiError(404, "Aufgabe nicht gefunden.")
             return {"ok": True}
+        finally:
+            conn.close()
+
+    # Werbe-Einwilligungen (DSGVO, § 174 TKG)
+
+    @staticmethod
+    def consents_of(conn, contact_id):
+        states = {r["channel"]: dict(r) for r in conn.execute(
+            "SELECT channel, state, since FROM consents WHERE contact_id = ?", (contact_id,))}
+        return {
+            "channels": [{"channel": key, "label": label, "state": states.get(key, {}).get("state", ""),
+                          "since": states.get(key, {}).get("since", "")} for key, label in CHANNELS.items()],
+            "events": [dict(r) for r in conn.execute(
+                "SELECT channel, state, at, source, proof, recorded_at FROM consent_events "
+                "WHERE contact_id = ? ORDER BY at DESC, id DESC", (contact_id,))],
+        }
+
+    @staticmethod
+    def set_consent(conn, contact_id, channel, state, at, source, proof, optin=("", "")):
+        """Setzt den Stand eines Kanals und hängt den Nachweis an. Der Abmeldeschlüssel bleibt je Kanal gleich."""
+        row = conn.execute("SELECT unsubscribe_token FROM consents WHERE contact_id = ? AND channel = ?",
+                           (contact_id, channel)).fetchone()
+        token = row["unsubscribe_token"] if row and row["unsubscribe_token"] else secrets.token_urlsafe(24)
+        conn.execute(
+            "INSERT INTO consents (contact_id, channel, state, since, optin_hash, optin_expires, unsubscribe_token) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (contact_id, channel) DO UPDATE SET state = excluded.state, "
+            "since = excluded.since, optin_hash = excluded.optin_hash, optin_expires = excluded.optin_expires, "
+            "unsubscribe_token = excluded.unsubscribe_token",
+            (contact_id, channel, state, at, optin[0], optin[1], token))
+        conn.execute(
+            "INSERT INTO consent_events (contact_id, channel, state, at, source, proof, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", (contact_id, channel, state, at, source, proof, now()))
+
+    def record_consent(self, contact_id, data):
+        channel = data.get("channel")
+        state = data.get("state")
+        if channel not in CHANNELS:
+            raise ApiError(400, "Kanal ungültig.")
+        if state not in ("erteilt", "widerrufen"):
+            raise ApiError(400, "Stand ungültig.")
+        source = body_text(data, "source", "die Herkunft")
+        if source not in CONSENT_SOURCES:
+            raise ApiError(400, "Herkunft ungültig.")
+        when = valid_date(body_text(data, "date", "ein Datum"), "Datum")
+        if when > date.today().isoformat():
+            raise ApiError(400, "Das Datum liegt in der Zukunft.")
+        proof = body_text(data, "proof", "Nachweis", required=False)
+        if state == "erteilt" and not proof:
+            raise ApiError(400, "Bitte festhalten, wie die Einwilligung vorliegt (zum Beispiel unterschriebenes Formular vom …).")
+        conn = self.db.connect()
+        try:
+            person = self.require(conn, "contacts", contact_id, "Kontakt nicht gefunden.")
+            if channel == "newsletter" and state == "erteilt" and not person["email"]:
+                raise ApiError(400, "Für den Newsletter braucht die Person eine E-Mail-Adresse.")
+            if channel == "telefon" and state == "erteilt" and not person["phone"]:
+                raise ApiError(400, "Für Anrufe braucht die Person eine Telefonnummer.")
+            with conn:
+                self.set_consent(conn, contact_id, channel, state, when, source, proof)
+            return self.consents_of(conn, contact_id)
+        finally:
+            conn.close()
+
+    # Zugänge für die Schnittstelle (Webseite)
+
+    def list_api_keys(self):
+        conn = self.db.connect()
+        try:
+            keys = [dict(r) for r in conn.execute(
+                "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at FROM api_keys ORDER BY id DESC")]
+            log = [dict(r) for r in conn.execute(
+                "SELECT l.at, l.method, l.path, l.status, k.name FROM api_log l LEFT JOIN api_keys k ON k.id = l.key_id "
+                "ORDER BY l.id DESC LIMIT 30")]
+            return {"keys": keys, "log": log}
+        finally:
+            conn.close()
+
+    def create_api_key(self, data):
+        name = body_text(data, "name", "einen Namen")
+        scopes = data.get("scopes")
+        if not isinstance(scopes, list) or not scopes or any(x not in API_SCOPES for x in scopes):
+            raise ApiError(400, "Bitte mindestens eine Berechtigung wählen.")
+        token = "mcrm_" + secrets.token_urlsafe(32)
+        conn = self.db.connect()
+        try:
+            with conn:
+                conn.execute("INSERT INTO api_keys (name, prefix, secret_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?)",
+                             (name, token[:12], hashlib.sha256(token.encode()).hexdigest(), ",".join(sorted(set(scopes))), now()))
+            # Der Schlüssel wird nur dieses eine Mal gezeigt, gespeichert ist nur sein Hash.
+            return {"token": token}
+        finally:
+            conn.close()
+
+    def revoke_api_key(self, key_id):
+        conn = self.db.connect()
+        try:
+            with conn:
+                if conn.execute("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at = ''",
+                                (now(), key_id)).rowcount == 0:
+                    raise ApiError(404, "Zugang nicht gefunden oder schon gesperrt.")
+            return {"ok": True}
+        finally:
+            conn.close()
+
+    def authenticate(self, header):
+        match = re.fullmatch(r"Bearer (mcrm_[A-Za-z0-9_-]{20,80})", header or "")
+        if not match:
+            raise ApiError(401, "Zugangsschlüssel fehlt oder ist ungültig.")
+        digest = hashlib.sha256(match[1].encode()).hexdigest()
+        conn = self.db.connect()
+        try:
+            row = conn.execute("SELECT * FROM api_keys WHERE secret_hash = ? AND revoked_at = ''", (digest,)).fetchone()
+            if not row or not hmac.compare_digest(row["secret_hash"], digest):
+                raise ApiError(401, "Zugangsschlüssel fehlt oder ist ungültig.")
+            with conn:
+                conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (now(), row["id"]))
+            return dict(row)
+        finally:
+            conn.close()
+
+    def log_api(self, key_id, method, path, status):
+        """Protokoll ohne Inhalte: nur Zeitpunkt, Zugang, Adresse und Ergebnis."""
+        conn = self.db.connect()
+        try:
+            with conn:
+                conn.execute("INSERT INTO api_log (at, key_id, method, path, status) VALUES (?, ?, ?, ?, ?)",
+                             (now(), key_id, method, path[:200], status))
+                conn.execute("DELETE FROM api_log WHERE id <= (SELECT MAX(id) FROM api_log) - ?", (API_LOG_KEPT,))
+        finally:
+            conn.close()
+
+    # Schnittstelle für die Webseite (/v1)
+
+    def ext_signup(self, data):
+        email = body_text(data, "email", "eine E-Mail-Adresse").lower()
+        valid_email(email)
+        consent_text = body_text(data, "consent_text", "den Einwilligungstext")
+        source_url = body_text(data, "source_url", "Adresse", required=False)
+        first = text_field(data.get("first_name", ""), "first_name")
+        last = text_field(data.get("last_name", ""), "last_name")
+        conn = self.db.connect()
+        try:
+            with conn:
+                row = conn.execute("SELECT id FROM contacts WHERE fold(email) = ? ORDER BY id LIMIT 1", (email,)).fetchone()
+                if row:
+                    contact_id = row["id"]
+                else:
+                    stamp = now()
+                    contact_id = conn.execute(
+                        "INSERT INTO contacts (uid, first_name, last_name, email, source, notes, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 'Webseite', ?, ?, ?)",
+                        (uuid.uuid4().hex, first, last, email, "Über die Webseite zum Newsletter angemeldet.", stamp, stamp)).lastrowid
+                state = conn.execute("SELECT state FROM consents WHERE contact_id = ? AND channel = 'newsletter'",
+                                     (contact_id,)).fetchone()
+                if state and state["state"] == "erteilt":
+                    return {"status": "bereits_bestaetigt"}
+                token = secrets.token_urlsafe(32)
+                expires = (datetime.now() + timedelta(days=OPTIN_DAYS)).isoformat(timespec="seconds")
+                proof = f"Anmeldung über {source_url or 'die Webseite'}. Einwilligungstext: {consent_text}"
+                self.set_consent(conn, contact_id, "newsletter", "ausstehend", now(), "Webseite (Double-Opt-in)",
+                                 proof, (hashlib.sha256(token.encode()).hexdigest(), expires))
+            return {"status": "bestaetigung_noetig", "confirm_token": token, "expires": expires}
+        finally:
+            conn.close()
+
+    def ext_confirm(self, data):
+        token = body_text(data, "token", "den Bestätigungsschlüssel")
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        conn = self.db.connect()
+        try:
+            row = conn.execute("SELECT * FROM consents WHERE channel = 'newsletter' AND state = 'ausstehend' "
+                               "AND optin_hash = ?", (digest,)).fetchone()
+            if not row:
+                raise ApiError(404, "Bestätigungslink unbekannt oder schon verwendet.")
+            if row["optin_expires"] < now():
+                raise ApiError(410, "Der Bestätigungslink ist abgelaufen. Bitte neu anmelden.")
+            with conn:
+                self.set_consent(conn, row["contact_id"], "newsletter", "erteilt", now(), "Webseite (Double-Opt-in)",
+                                 "Bestätigungslink aus der E-Mail aufgerufen (Double-Opt-in).")
+            return {"status": "bestaetigt"}
+        finally:
+            conn.close()
+
+    def ext_unsubscribe(self, data):
+        token = body_text(data, "token", "den Abmeldeschlüssel")
+        conn = self.db.connect()
+        try:
+            row = conn.execute("SELECT * FROM consents WHERE channel = 'newsletter' AND unsubscribe_token = ?",
+                               (token,)).fetchone()
+            if not row:
+                raise ApiError(404, "Abmeldelink unbekannt.")
+            if row["state"] != "widerrufen":
+                with conn:
+                    self.set_consent(conn, row["contact_id"], "newsletter", "widerrufen", now(), "Webseite",
+                                     "Abmeldelink aus dem Newsletter aufgerufen.")
+            return {"status": "abgemeldet"}
+        finally:
+            conn.close()
+
+    def ext_recipients(self):
+        conn = self.db.connect()
+        try:
+            return {"recipients": [dict(r) for r in conn.execute(
+                "SELECT c.uid, c.email, c.first_name, c.last_name, k.since, k.unsubscribe_token "
+                "FROM consents k JOIN contacts c ON c.id = k.contact_id "
+                "WHERE k.channel = 'newsletter' AND k.state = 'erteilt' AND c.email != '' ORDER BY fold(c.email)")]}
+        finally:
+            conn.close()
+
+    def ext_people(self, query):
+        area = query.get("bereich", [""])[0]
+        where = {"privat": "WHERE c.private = 1",
+                 "firma": "WHERE EXISTS (SELECT 1 FROM affiliations f WHERE f.contact_id = c.id)"}.get(area, "")
+        conn = self.db.connect()
+        try:
+            links = {}
+            for r in conn.execute("SELECT f.contact_id, co.uid, co.name, f.kind FROM affiliations f "
+                                  "JOIN companies co ON co.id = f.company_id"):
+                links.setdefault(r["contact_id"], []).append({"uid": r["uid"], "name": r["name"], "kind": r["kind"]})
+            people = []
+            for r in conn.execute(
+                    "SELECT c.id, c.uid, c.first_name, c.last_name, c.email, c.phone, c.private, c.status, "
+                    f"c.updated_at, hh.name AS household FROM contacts c LEFT JOIN households hh ON hh.id = c.household_id {where} "
+                    "ORDER BY fold(c.last_name), fold(c.first_name)"):
+                person = {k: r[k] for k in ("uid", "first_name", "last_name", "email", "phone", "household", "updated_at")}
+                person["private_client"] = bool(r["private"])
+                person["private_status"] = r["status"] if r["private"] else None
+                person["companies"] = links.get(r["id"], [])
+                people.append(person)
+            return {"people": people}
+        finally:
+            conn.close()
+
+    def ext_companies(self):
+        conn = self.db.connect()
+        try:
+            return {"companies": [dict(r) for r in conn.execute(
+                "SELECT uid, name, legal_form, register_no, industry, website, address, phone, email, status, updated_at "
+                "FROM companies ORDER BY fold(name)")]}
         finally:
             conn.close()
 
@@ -1338,11 +1910,11 @@ class Api:
                 ["co.name", "co.industry", "co.register_no", "co.website", "co.phone", "co.phone2", "co.email",
                  "co.address", "co.notes"], ["co.phone", "co.phone2"])
             people = run(
-                conn, "SELECT c.id, c.first_name, c.last_name, c.role, c.phone, c.email, c.status, c.company_id, "
-                      "co.name AS company_name, co.status AS company_status "
-                      "FROM contacts c LEFT JOIN companies co ON co.id = c.company_id",
-                ["c.first_name", "c.last_name", "co.name", "c.role", "c.email", "c.phone", "c.address", "c.notes"],
-                ["c.phone"])
+                conn, f"SELECT c.id, c.first_name, c.last_name, c.phone, c.email, c.status, c.private, "
+                      f"{CONTACT_COMPANIES} AS company_names, hh.name AS household_name "
+                      "FROM contacts c LEFT JOIN households hh ON hh.id = c.household_id",
+                ["c.first_name", "c.last_name", CONTACT_COMPANIES, "hh.name", "c.email", "c.phone", "c.address",
+                 "c.notes"], ["c.phone"])
             referrers = run(conn, "SELECT r.id, r.name, r.phone, r.email FROM referrers r",
                             ["r.name", "r.email", "r.phone", "r.notes"], ["r.phone"])
         finally:
@@ -1391,8 +1963,8 @@ class Api:
                 full = re.sub(r"[^a-zäöüß]", "", first + last)
                 email, phone = fold(get("email")), phone_key(get("phone"))
                 for row in conn.execute(
-                        "SELECT c.id, c.first_name, c.last_name, c.email, c.phone, c.role, co.name AS company_name "
-                        "FROM contacts c LEFT JOIN companies co ON co.id = c.company_id"):
+                        f"SELECT c.id, c.first_name, c.last_name, c.email, c.phone, c.private, "
+                        f"{CONTACT_COMPANIES} AS company_names FROM contacts c"):
                     if row["id"] == exclude:
                         continue
                     strong, weak = [], []
@@ -1408,7 +1980,7 @@ class Api:
                     if phone and phone == phone_key(row["phone"]):
                         weak.append("gleiche Telefonnummer")
                     if strong or weak:
-                        sub = " · ".join(x for x in (row["company_name"] or "Privatperson", row["role"]) if x)
+                        sub = " · ".join(x for x in (row["company_names"], "Privatkunde" if row["private"] else "") if x)
                         matches.append({"id": row["id"], "label": person_name(row), "sub": sub, "status": "",
                                         "strong": bool(strong), "reasons": strong + weak, "score": len(strong)})
             else:
@@ -1420,25 +1992,30 @@ class Api:
 
     # Übersicht und Pipeline
 
-    def pipeline(self):
+    def pipeline(self, query):
+        area = query.get("bereich", [""])[0]
         items = []
-        for company in self.list_companies():
+        for company in ([] if area == "privat" else self.list_companies()):
             items.append({
                 "kind": "company", "id": company["id"], "name": company["name"], "status": company["status"],
                 "sub": company["industry"], "next_due": company["next_due"], "grade": company["rating"]["grade"],
             })
         conn = self.db.connect()
         try:
-            for row in conn.execute(f"{CONTACT_SELECT} WHERE c.company_id IS NULL"):
+            rows = [] if area == "firma" else conn.execute(f"{CONTACT_SELECT} WHERE c.private = 1")
+            for row in rows:
                 items.append({
                     "kind": "contact", "id": row["id"], "name": person_name(row), "status": row["status"],
-                    "sub": "Privatperson", "next_due": row["next_due"], "grade": None,
+                    "sub": row["household_name"] and f"Haushalt {row['household_name']}" or "Privatkunde",
+                    "next_due": row["next_due"], "grade": None,
                 })
         finally:
             conn.close()
         return sorted(items, key=lambda i: fold(i["name"]))
 
-    def overview(self):
+    def overview(self, query):
+        area = query.get("bereich", [""])[0]
+        area = area if area in AREAS else ""
         today = date.today().isoformat()
         quiet_before = (date.today() - timedelta(days=QUIET_DAYS)).isoformat()
         conn = self.db.connect()
@@ -1447,22 +2024,28 @@ class Api:
                 "SELECT t.id, t.title, t.due, t.contact_id, t.company_id, p.first_name, p.last_name, "
                 "o.name AS company_name FROM tasks t LEFT JOIN contacts p ON p.id = t.contact_id "
                 "LEFT JOIN companies o ON o.id = t.company_id WHERE t.done_at = '' "
+                + ("AND t.area = ? " if area else "")
             )
-            overdue = [dict(r) for r in conn.execute(task_sql + "AND t.due != '' AND t.due < ? ORDER BY t.due", (today,))]
-            due_today = [dict(r) for r in conn.execute(task_sql + "AND t.due = ? ORDER BY t.id", (today,))]
-            upcoming = [dict(r) for r in conn.execute(task_sql + "AND t.due > ? ORDER BY t.due LIMIT 8", (today,))]
+            only = (area,) if area else ()
+            overdue = [dict(r) for r in conn.execute(task_sql + "AND t.due != '' AND t.due < ? ORDER BY t.due", only + (today,))]
+            due_today = [dict(r) for r in conn.execute(task_sql + "AND t.due = ? ORDER BY t.id", only + (today,))]
+            upcoming = [dict(r) for r in conn.execute(task_sql + "AND t.due > ? ORDER BY t.due LIMIT 8", only + (today,))]
             counts = {s: 0 for s in STATUSES}
-            for query in ("SELECT status, COUNT(*) AS n FROM companies GROUP BY status",
-                          "SELECT status, COUNT(*) AS n FROM contacts WHERE company_id IS NULL GROUP BY status"):
-                for row in conn.execute(query):
+            sources = {"firma": ["SELECT status, COUNT(*) AS n FROM companies GROUP BY status"],
+                       "privat": ["SELECT status, COUNT(*) AS n FROM contacts WHERE private = 1 GROUP BY status"]}
+            for sql in sources.get(area) or sources["firma"] + sources["privat"]:
+                for row in conn.execute(sql):
                     counts[row["status"]] = counts.get(row["status"], 0) + row["n"]
-            quiet = [dict(r) for r in conn.execute(
-                f"SELECT 'company' AS kind, co.id, co.name, {COMPANY_LAST_CONTACT} AS last_contact, co.created_at "
-                "FROM companies co WHERE co.status = 'Kunde' UNION ALL "
-                "SELECT 'contact', c.id, TRIM(c.first_name || ' ' || c.last_name), "
-                "(SELECT MAX(a.date) FROM activities a WHERE a.contact_id = c.id AND a.kind != 'System'), c.created_at "
-                "FROM contacts c WHERE c.status = 'Kunde' AND c.company_id IS NULL")
-                if (r["last_contact"] or r["created_at"][:10]) < quiet_before]
+            quiet_parts = {
+                "firma": f"SELECT 'company' AS kind, co.id, co.name, {COMPANY_LAST_CONTACT} AS last_contact, "
+                         "co.created_at FROM companies co WHERE co.status = 'Kunde'",
+                "privat": "SELECT 'contact' AS kind, c.id, TRIM(c.first_name || ' ' || c.last_name) AS name, "
+                          "(SELECT MAX(a.date) FROM activities a WHERE a.contact_id = c.id AND a.kind != 'System') "
+                          "AS last_contact, c.created_at FROM contacts c WHERE c.status = 'Kunde' AND c.private = 1",
+            }
+            quiet_sql = quiet_parts[area] if area else " UNION ALL ".join(quiet_parts.values())
+            quiet = [dict(r) for r in conn.execute(quiet_sql)
+                     if (r["last_contact"] or r["created_at"][:10]) < quiet_before]
             quiet.sort(key=lambda r: r["last_contact"] or r["created_at"][:10])
             consent_open = conn.execute(
                 "SELECT COUNT(*) FROM contacts WHERE consent IN ('Offen', 'Widerrufen')").fetchone()[0]
@@ -1470,7 +2053,8 @@ class Api:
                 "SELECT a.id, a.kind, a.date, a.text, a.contact_id, a.company_id, p.first_name, p.last_name, "
                 "o.name AS company_name FROM activities a LEFT JOIN contacts p ON p.id = a.contact_id "
                 "LEFT JOIN companies o ON o.id = a.company_id "
-                "WHERE a.kind != 'System' ORDER BY a.date DESC, a.id DESC LIMIT 6")]
+                "WHERE a.kind != 'System' " + ("AND a.area = ? " if area else "") +
+                "ORDER BY a.date DESC, a.id DESC LIMIT 6", only)]
             return {
                 "overdue": overdue, "today": due_today, "upcoming": upcoming, "counts": counts,
                 "quiet": quiet[:10], "consentOpen": consent_open, "recent": recent,
@@ -1482,18 +2066,23 @@ class Api:
 
     def export_contacts(self):
         headers = {
-            "first_name": "Vorname", "last_name": "Nachname", "company_name": "Firma", "role": "Funktion",
-            "email": "E-Mail", "phone": "Telefon", "address": "Anschrift", "source": "Quelle",
-            "referrer_name": "Empfehler", "status_shown": "Status", "consent": "Datenschutz",
-            "consent_date": "Datenschutz am", "notes": "Notizen", "last_contact": "Letzter Kontakt",
+            "first_name": "Vorname", "last_name": "Nachname", "company_names": "Firmen",
+            "email": "E-Mail", "phone": "Telefon", "address": "Anschrift", "household_name": "Haushalt",
+            "private_shown": "Privatkunde", "status_shown": "Status privat", "source": "Quelle",
+            "referrer_name": "Empfehler", "consent": "Datenschutz", "consent_date": "Datenschutz am",
+            "newsletter": "Newsletter", "notes": "Notizen", "last_contact": "Letzter Kontakt",
         }
         conn = self.db.connect()
         try:
             rows = [dict(r) for r in conn.execute(f"{CONTACT_SELECT} ORDER BY fold(c.last_name), fold(c.first_name)")]
+            letters = {r["contact_id"]: r["state"] for r in conn.execute(
+                "SELECT contact_id, state FROM consents WHERE channel = 'newsletter'")}
         finally:
             conn.close()
         for row in rows:
-            row["status_shown"] = row["company_status"] or row["status"]
+            row["private_shown"] = "ja" if row["private"] else ""
+            row["status_shown"] = row["status"] if row["private"] else ""
+            row["newsletter"] = CONSENT_STATES.get(letters.get(row["id"], ""), "")
         return self.to_csv(headers, rows)
 
     def export_companies(self):
@@ -1534,8 +2123,18 @@ def make_handler(api, port):
 
     routes = [
         ("GET", r"/api/meta", lambda m, q, b: api.meta()),
-        ("GET", r"/api/overview", lambda m, q, b: api.overview()),
-        ("GET", r"/api/pipeline", lambda m, q, b: api.pipeline()),
+        ("GET", r"/api/overview", lambda m, q, b: api.overview(q)),
+        ("GET", r"/api/pipeline", lambda m, q, b: api.pipeline(q)),
+        ("GET", r"/api/households", lambda m, q, b: api.list_households()),
+        ("POST", r"/api/contacts/(\d+)/companies", lambda m, q, b: api.add_link(int(m[1]), b)),
+        ("PUT", r"/api/links/(\d+)", lambda m, q, b: api.update_link(int(m[1]), b)),
+        ("DELETE", r"/api/links/(\d+)", lambda m, q, b: api.delete_row("affiliations", int(m[1]), "Verbindung nicht gefunden.")),
+        ("POST", r"/api/contacts/(\d+)/relations", lambda m, q, b: api.add_relation(int(m[1]), b)),
+        ("DELETE", r"/api/relations/(\d+)", lambda m, q, b: api.delete_row("relations", int(m[1]), "Verbindung nicht gefunden.")),
+        ("POST", r"/api/contacts/(\d+)/consents", lambda m, q, b: api.record_consent(int(m[1]), b)),
+        ("GET", r"/api/apikeys", lambda m, q, b: api.list_api_keys()),
+        ("POST", r"/api/apikeys", lambda m, q, b: api.create_api_key(b)),
+        ("DELETE", r"/api/apikeys/(\d+)", lambda m, q, b: api.revoke_api_key(int(m[1]))),
         ("GET", r"/api/tree", lambda m, q, b: api.tree()),
         ("GET", r"/api/search", lambda m, q, b: api.search(q)),
         ("GET", r"/api/similar", lambda m, q, b: api.similar(q)),
@@ -1703,6 +2302,9 @@ def make_handler(api, port):
                 return
             parsed = urlparse(self.path)
             path = parsed.path
+            if path.startswith("/v1/"):
+                self.external(parsed)
+                return
             try:
                 if path == "/api/ocr" and self.command == "POST":
                     self.send_json(200, self.recognize_text())
@@ -1753,6 +2355,44 @@ def make_handler(api, port):
             except sqlite3.Error as err:
                 self.log_error("Datenbankfehler: %s", err)
                 self.send_json(500, {"error": "Datenbankfehler."})
+
+        def external(self, parsed):
+            """Schnittstelle für die Webseite: nur mit Zugangsschlüssel, nur die freigegebenen Bereiche."""
+            key_id, status = None, 500
+            try:
+                key = api.authenticate(self.headers.get("Authorization"))
+                key_id = key["id"]
+                scopes = set(key["scopes"].split(","))
+                query = parse_qs(parsed.query)
+                routes_v1 = {
+                    ("GET", "/v1/status"): (None, lambda: {"ok": True, "version": VERSION, "scopes": sorted(scopes)}),
+                    ("POST", "/v1/newsletter/anmeldung"): ("newsletter", lambda: api.ext_signup(self.read_json())),
+                    ("POST", "/v1/newsletter/bestaetigung"): ("newsletter", lambda: api.ext_confirm(self.read_json())),
+                    ("POST", "/v1/newsletter/abmeldung"): ("newsletter", lambda: api.ext_unsubscribe(self.read_json())),
+                    ("GET", "/v1/newsletter/empfaenger"): ("newsletter", api.ext_recipients),
+                    ("GET", "/v1/personen"): ("lesen", lambda: api.ext_people(query)),
+                    ("GET", "/v1/firmen"): ("lesen", api.ext_companies),
+                }
+                route = routes_v1.get((self.command, parsed.path))
+                if not route:
+                    raise ApiError(404, "Nicht gefunden.")
+                scope, fn = route
+                if scope and scope not in scopes:
+                    raise ApiError(403, "Dieser Zugang darf das nicht.")
+                result = fn()
+                status = 200
+                self.send_json(200, result)
+            except ApiError as err:
+                status = err.status
+                self.send_json(err.status, {"error": err.message})
+            except sqlite3.Error as err:
+                self.log_error("Datenbankfehler: %s", err)
+                self.send_json(500, {"error": "Datenbankfehler."})
+            finally:
+                try:
+                    api.log_api(key_id, self.command, parsed.path, status)
+                except sqlite3.Error:
+                    pass
 
         def serve_static(self, path):
             rel = "index.html" if path == "/" else path.lstrip("/")

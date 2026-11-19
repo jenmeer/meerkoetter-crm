@@ -25,7 +25,7 @@ h2{font-size:1.25rem}
 main:focus{outline:none}
 
 .topbar{background:var(--navy);position:sticky;top:0;z-index:10}
-.topbar-inner{max-width:1200px;margin:0 auto;padding:10px 24px;display:flex;align-items:center;gap:32px;min-height:64px}
+.topbar-inner{max-width:1480px;margin:0 auto;padding:10px 24px;display:flex;align-items:center;gap:32px;min-height:64px}
 .brand img{display:block;height:38px;width:auto}
 .mainnav{display:flex;flex-wrap:wrap;gap:4px 22px;flex:1}
 .top-actions{display:flex;gap:8px}
@@ -205,11 +205,11 @@ dialog:has(.steps){width:min(860px,calc(100vw - 32px))}
 select.compact{width:auto;margin:0;padding:4px 6px;font-size:13px}
 .tile-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 
-@media (min-width:1181px){
+@media (min-width:1441px){
   .mainnav{flex:none;flex-wrap:nowrap}
   .top-actions{margin-left:auto}
 }
-@media (max-width:1180px){
+@media (max-width:1440px){
   .topbar-inner{flex-wrap:wrap;gap:10px 24px}
   .global-search{order:5;flex:1 0 100%;max-width:none}
   .search-panel{width:100%}
@@ -254,3 +254,24 @@ select.compact{width:auto;margin:0;padding:4px 6px;font-size:13px}
 .btn-small{padding:3px 10px;font-size:12px;min-height:0}
 .newfirm{border:1px solid var(--linie);border-radius:8px;padding:12px 14px;display:grid;gap:8px}
 .dupes li.strong a{color:var(--warn);font-weight:500}
+
+/* Bereichsfilter Firma / Privat in der Kopfzeile */
+.areafilter{display:flex;border:1px solid rgba(255,255,255,.35);border-radius:999px;overflow:hidden;flex:none}
+.areafilter button{background:transparent;color:#fff;border:0;padding:5px 12px;font:500 13px var(--lese);cursor:pointer}
+.areafilter button:hover{color:var(--gold-hell)}
+.areafilter button[aria-pressed="true"]{background:var(--gold);color:var(--navy-tief)}
+.areanote{font-size:13px;color:var(--neben);margin:-6px 0 14px}
+.tag-area{font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-radius:4px;padding:1px 6px;margin-left:6px;background:var(--blaugrau);color:var(--navy)}
+.tag-area.privat{background:#f3ead3;color:var(--gold-text)}
+.tag-house{display:inline-block;white-space:nowrap;font-size:12px;border:1px solid var(--linie);border-radius:999px;padding:1px 8px;color:var(--navy);text-decoration:none;background:var(--weiss)}
+.tag-house:hover{border-color:var(--gold)}
+.links li{align-items:center}
+.links .grow small{display:block}
+.consent-grid{display:grid;gap:6px;margin-bottom:10px}
+.consent-row{display:flex;justify-content:space-between;gap:10px;align-items:center;border-bottom:1px solid var(--linie);padding:6px 0}
+.state-erteilt{color:#2e6b3a;font-weight:500}
+.state-widerrufen{color:var(--warn);font-weight:500}
+.state-ausstehend{color:var(--gold-text);font-weight:500}
+.tokenbox{font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all;background:var(--hell);border:1px solid var(--linie);border-radius:6px;padding:10px}
+.subhead{font:600 13px var(--lese);text-transform:uppercase;letter-spacing:.04em;color:var(--neben);margin:14px 0 6px}
+@media (max-width: 900px){.areafilter{order:3}}
