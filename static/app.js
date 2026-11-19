@@ -41,8 +41,63 @@ async function api(path, method = "GET", body) {
     throw new Error("Der CRM-Server antwortet nicht. Läuft er noch?");
   }
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.login) {
+    showLogin();
+    throw new Error("Bitte neu anmelden.");
+  }
   if (!res.ok) throw new Error(data.error || "Das hat nicht geklappt.");
   return data;
+}
+
+/* Anmeldung (nur im Server-Modus, wenn das CRM unterwegs erreichbar ist) */
+
+let authMode = "lokal";
+function showLogin(message) {
+  document.body.classList.add("logged-out");
+  const email = h("input", { type: "email", autocomplete: "username", required: true });
+  const password = h("input", { type: "password", autocomplete: "current-password", required: true });
+  const code = h("input", { inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]*", maxlength: 7, placeholder: "6 Ziffern" });
+  const error = h("p", { class: "error", hidden: !message }, message || "");
+  const submit = h("button", { class: "btn", type: "submit" }, "Anmelden");
+  setView(h("div", { class: "login" },
+    h("img", { src: "favicon.svg", alt: "", class: "login-mark" }),
+    h("h1", {}, "Meerkötter CRM"),
+    h("form", {
+      class: "form",
+      onsubmit: async (e) => {
+        e.preventDefault();
+        submit.disabled = true;
+        error.hidden = true;
+        try {
+          const res = await fetch("/auth/login", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email: email.value, password: password.value, code: code.value }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || "Anmeldung fehlgeschlagen.");
+          location.reload();
+        } catch (err) {
+          error.textContent = err.message;
+          error.hidden = false;
+          password.value = "";
+          code.value = "";
+          submit.disabled = false;
+        }
+      },
+    },
+      field("E-Mail", email),
+      field("Passwort", password),
+      field("Code aus der Authenticator-App", code),
+      error,
+      submit),
+    h("p", { class: "small muted" }, "Nach 8 Stunden ohne Aktivität wirst du automatisch abgemeldet.")));
+  setTimeout(() => email.focus(), 50);
+}
+
+async function logout() {
+  await fetch("/auth/logout", { method: "POST" }).catch(() => {});
+  location.hash = "#/";
+  location.reload();
 }
 
 let toastTimer;
@@ -1887,7 +1942,7 @@ async function renderContact(token, id) {
 /* Einstellungen: Daten übertragen und Zugänge für die Webseite */
 
 async function renderSettings(token) {
-  const data = await api("/api/apikeys");
+  const [data, security] = await Promise.all([api("/api/apikeys"), api("/api/sessions")]);
   if (token !== renderToken) return;
   const refresh = () => route();
   const newKey = () => openDialog("Neuer Zugang für die Webseite", (close) => {
@@ -1948,6 +2003,17 @@ async function renderSettings(token) {
                 }, "Sperren"))))
             : h("p", { class: "empty" }, "Noch kein Zugang angelegt."),
           h("div", { class: "form-end spaced" }, h("button", { class: "btn btn-ghost", type: "button", onclick: newKey }, "Neuer Zugang"))),
+        security.mode === "server" ? section("Anmeldungen",
+          h("div", { class: "subhead" }, "Angemeldete Geräte"),
+          h("ul", { class: "rows" }, security.sessions.map((x) => h("li", {},
+            h("div", { class: "grow small" }, h("b", {}, x.agent.replace(/\(.*?\)/g, "").slice(0, 60) || "Unbekanntes Gerät"),
+              h("div", { class: "muted" }, `seit ${x.created_at.replace("T", " ").slice(0, 16)} · zuletzt ${x.last_seen.replace("T", " ").slice(0, 16)}`)),
+            h("button", { class: "iconbtn", type: "button", onclick: () => attempt(async () => { await api(`/api/sessions/${x.id}`, "DELETE"); refresh(); }) }, "Abmelden")))),
+          h("div", { class: "subhead" }, "Letzte Anmeldeversuche"),
+          h("ul", { class: "rows" }, security.logins.map((l) => h("li", {},
+            h("div", { class: "grow small" }, `${l.at.replace("T", " ").slice(0, 16)} · ${l.email} · ${l.ip}`,
+              l.reason ? h("div", { class: "muted" }, l.reason) : null),
+            h("span", { class: `small ${l.ok ? "muted" : "overdue"}` }, l.ok ? "ok" : "abgelehnt"))))) : null,
         data.log.length ? section("Letzte Zugriffe",
           h("ul", { class: "rows" }, data.log.map((l) => h("li", {},
             h("div", { class: "grow small" }, `${l.at.replace("T", " ")} · ${l.name || "ohne gültigen Schlüssel"} · ${l.method} ${l.path}`),
@@ -2243,6 +2309,15 @@ async function route() {
 
 async function start() {
   try {
+    const status = await fetch("/auth/status").then((r) => r.json());
+    authMode = status.mode;
+    if (authMode === "server") {
+      if (!status.user) { showLogin(); return; }
+      document.getElementById("top-actions").append(
+        h("button", { class: "btn btn-ghost", type: "button", title: `Angemeldet als ${status.user.email}`, onclick: logout }, "Abmelden"));
+    }
+  } catch { /* ältere Version oder lokal: ohne Anmeldung weiter */ }
+  try {
     meta = await api("/api/meta");
   } catch (err) {
     setView(h("div", { class: "note" }, err.message));
@@ -2259,3 +2334,8 @@ async function start() {
 }
 
 start();
+
+// Installierbare Webapp: nur über HTTPS oder auf dem eigenen Rechner, nicht im App-Fenster.
+if ("serviceWorker" in navigator && !window.pywebview && (location.protocol === "https:" || location.hostname === "127.0.0.1" || location.hostname === "localhost")) {
+  navigator.serviceWorker.register("/sw.js").catch(() => { /* ohne Offline-Start weiter */ });
+}

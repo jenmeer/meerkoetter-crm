@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Lokales CRM für Jens Meerkötter. Nur Python-Standardbibliothek, nur auf diesem Rechner erreichbar."""
 import argparse
+import base64
+import getpass
+import struct
+import time
 import csv
 import hashlib
 import hmac
@@ -9,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import uuid
 import sqlite3
@@ -22,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 # In der gebauten App liegen Programmdateien im Paket (PyInstaller), sonst neben server.py.
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 STATIC_DIR = APP_DIR / "static"
@@ -48,7 +53,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # unter Windows kein auf
 IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/heic": ".heic", "image/tiff": ".tiff",
                "image/gif": ".gif", "image/webp": ".webp"}
 BACKUPS_KEPT = 30
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SEARCH_LIMIT = 8  # Treffer je Gruppe in der Ergebnisliste
 QUIET_DAYS = 180  # Kundinnen und Kunden ohne Kontakt seit so vielen Tagen werden gemeldet
 
@@ -85,6 +90,14 @@ CONSENT_STATES = {"": "Keine Angabe", "ausstehend": "Bestätigung ausstehend", "
 CONSENT_SOURCES = ["Persönlich", "Schriftlich", "E-Mail", "Telefon", "Webseite (Double-Opt-in)", "Sonstiges"]
 API_SCOPES = {"newsletter": "Newsletter: Anmeldung, Bestätigung, Abmeldung, Empfängerliste",
               "lesen": "Lesen: Personen und Firmen (Grunddaten)"}
+# Anmeldung im Server-Modus (unterwegs per Webapp). Lokal am Mac gibt es keine Anmeldung.
+SESSION_IDLE = timedelta(hours=8)      # ohne Aktivität so lange angemeldet
+SESSION_MAX = timedelta(days=14)       # spätestens dann neu anmelden
+LOGIN_LOCK_AFTER = 5                   # Fehlversuche je Konto, danach Sperre
+LOGIN_LOCK_FOR = timedelta(minutes=15)
+LOGIN_IP_LIMIT = 20                    # Fehlversuche je Adresse und Stunde
+MIN_PASSWORD = 12
+COOKIE = "crm_sitzung"
 OPTIN_DAYS = 7  # so lange gilt der Bestätigungslink einer Newsletter-Anmeldung
 API_LOG_KEPT = 5000
 
@@ -457,6 +470,37 @@ MIGRATION_V4 = [
 ]
 
 
+MIGRATION_V5 = [
+    """CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        pw_hash TEXT NOT NULL,
+        totp_secret TEXT NOT NULL,
+        totp_last INTEGER NOT NULL DEFAULT 0,
+        failed INTEGER NOT NULL DEFAULT 0,
+        locked_until TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        agent TEXT NOT NULL DEFAULT ''
+    )""",
+    """CREATE TABLE login_log (
+        id INTEGER PRIMARY KEY,
+        at TEXT NOT NULL,
+        email TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        reason TEXT NOT NULL DEFAULT ''
+    )""",
+    "CREATE INDEX idx_login_log_ip ON login_log(ip, at)",
+]
+
+
 def migrate_v4(conn):
     """Personen getrennt von Firmen: mehrere Firmen je Person, Privatkunden, Haushalt, Verbindungen,
     Werbe-Einwilligungen, Zugänge für die Schnittstelle und eindeutige Kennungen für eine spätere Synchronisierung."""
@@ -468,6 +512,43 @@ def migrate_v4(conn):
     broken = conn.execute("PRAGMA foreign_key_check").fetchall()
     if broken:
         raise RuntimeError(f"Umbau abgebrochen, {len(broken)} ungültige Bezüge")
+
+
+def hash_password(password):
+    """scrypt aus der Standardbibliothek, mit eigenem Salz je Passwort."""
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+    return f"scrypt$32768$8$1${salt.hex()}${digest.hex()}"
+
+
+def check_password(password, stored):
+    try:
+        _, n, r, p, salt, digest = stored.split("$")
+        test = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=int(n), r=int(r), p=int(p),
+                              maxmem=64 * 1024 * 1024, dklen=32)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(test.hex(), digest)
+
+
+def totp_code(secret, counter):
+    """Einmalcode nach RFC 6238 (wie Google Authenticator, Microsoft Authenticator, 1Password)."""
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 1_000_000:06d}"
+
+
+def totp_match(secret, code, last_counter, at=None):
+    """Gültig im aktuellen 30-Sekunden-Fenster und je einem davor und danach; jeder Code nur einmal."""
+    code = re.sub(r"\s", "", code or "")
+    if not re.fullmatch(r"\d{6}", code):
+        return None
+    now_counter = int((at or time.time()) // 30)
+    for counter in (now_counter - 1, now_counter, now_counter + 1):
+        if counter > last_counter and hmac.compare_digest(totp_code(secret, counter), code):
+            return counter
+    return None
 
 
 class Database:
@@ -510,6 +591,9 @@ class Database:
                     migrate_v3(conn)
                 if version < 4:
                     migrate_v4(conn)
+                if version < 5:
+                    for statement in MIGRATION_V5:
+                        conn.execute(statement)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except Exception:
@@ -1505,6 +1589,120 @@ class Api:
         finally:
             conn.close()
 
+    # Anmeldung (Server-Modus)
+
+    def create_user(self, email, password):
+        """Legt das Konto an oder setzt Passwort und zweiten Faktor neu. Liefert den neuen TOTP-Schlüssel."""
+        email = email.strip().lower()
+        valid_email(email)
+        if not email:
+            raise ApiError(400, "Bitte eine E-Mail-Adresse angeben.")
+        if len(password) < MIN_PASSWORD:
+            raise ApiError(400, f"Das Passwort braucht mindestens {MIN_PASSWORD} Zeichen.")
+        secret = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+        conn = self.db.connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO users (email, pw_hash, totp_secret, created_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (email) DO UPDATE SET pw_hash = excluded.pw_hash, totp_secret = excluded.totp_secret, "
+                    "totp_last = 0, failed = 0, locked_until = ''",
+                    (email, hash_password(password), secret, now()))
+                # Neues Passwort: alle bestehenden Sitzungen dieses Kontos beenden.
+                conn.execute("DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = ?)", (email,))
+            return secret
+        finally:
+            conn.close()
+
+    def login(self, data, ip, agent):
+        email = text_field(data.get("email", ""), "email").strip().lower()
+        password = data.get("password") if isinstance(data.get("password"), str) else ""
+        code = text_field(data.get("code", ""), "code")
+        failure = ApiError(401, "Anmeldung fehlgeschlagen. Bitte E-Mail, Passwort und Code prüfen.")
+        conn = self.db.connect()
+        try:
+            hour_ago = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+            recent = conn.execute("SELECT COUNT(*) FROM login_log WHERE ip = ? AND ok = 0 AND at > ?", (ip, hour_ago)).fetchone()[0]
+            log = lambda ok, reason: conn.execute(
+                "INSERT INTO login_log (at, email, ip, ok, reason) VALUES (?, ?, ?, ?, ?)", (now(), email[:120], ip, ok, reason))
+            if recent >= LOGIN_IP_LIMIT:
+                with conn:
+                    log(0, "zu viele Versuche von dieser Adresse")
+                raise ApiError(429, "Zu viele Versuche. Bitte später noch einmal.")
+            user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+            if user and user["locked_until"] and user["locked_until"] > now():
+                with conn:
+                    log(0, "Konto gesperrt")
+                raise ApiError(429, "Zu viele Fehlversuche. Das Konto ist für 15 Minuten gesperrt.")
+            # Auch ohne Konto rechnen, damit die Antwortzeit nichts verrät.
+            password_ok = check_password(password, user["pw_hash"] if user else hash_password("x" * MIN_PASSWORD))
+            counter = totp_match(user["totp_secret"], code, user["totp_last"]) if user and password_ok else None
+            if not user or not password_ok or counter is None:
+                with conn:
+                    if user:
+                        failed = user["failed"] + 1
+                        locked = (datetime.now() + LOGIN_LOCK_FOR).isoformat(timespec="seconds") if failed >= LOGIN_LOCK_AFTER else ""
+                        conn.execute("UPDATE users SET failed = ?, locked_until = ? WHERE id = ?",
+                                     (0 if locked else failed, locked, user["id"]))
+                    log(0, "falsches Passwort oder falscher Code" if user else "unbekanntes Konto")
+                raise failure
+            token = secrets.token_urlsafe(32)
+            with conn:
+                conn.execute("UPDATE users SET failed = 0, locked_until = '', totp_last = ? WHERE id = ?", (counter, user["id"]))
+                conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen, agent) VALUES (?, ?, ?, ?, ?)",
+                             (hashlib.sha256(token.encode()).hexdigest(), user["id"], now(), now(), (agent or "")[:200]))
+                log(1, "")
+                conn.execute("DELETE FROM login_log WHERE at < ?", ((datetime.now() - timedelta(days=90)).isoformat(),))
+            return token, {"email": user["email"]}
+        finally:
+            conn.close()
+
+    def session_user(self, token):
+        if not token:
+            return None
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        conn = self.db.connect()
+        try:
+            row = conn.execute("SELECT s.*, u.email FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
+                               (digest,)).fetchone()
+            if not row:
+                return None
+            stamp = datetime.now()
+            if (datetime.fromisoformat(row["last_seen"]) + SESSION_IDLE < stamp
+                    or datetime.fromisoformat(row["created_at"]) + SESSION_MAX < stamp):
+                with conn:
+                    conn.execute("DELETE FROM sessions WHERE id = ?", (row["id"],))
+                return None
+            with conn:
+                conn.execute("UPDATE sessions SET last_seen = ? WHERE id = ?", (now(), row["id"]))
+            return {"email": row["email"], "session_id": row["id"]}
+        finally:
+            conn.close()
+
+    def logout(self, token):
+        conn = self.db.connect()
+        try:
+            with conn:
+                conn.execute("DELETE FROM sessions WHERE token_hash = ?", (hashlib.sha256((token or "").encode()).hexdigest(),))
+        finally:
+            conn.close()
+
+    def security_overview(self):
+        conn = self.db.connect()
+        try:
+            return {
+                "sessions": [dict(r) for r in conn.execute(
+                    "SELECT s.id, u.email, s.created_at, s.last_seen, s.agent FROM sessions s JOIN users u ON u.id = s.user_id "
+                    "ORDER BY s.last_seen DESC")],
+                "logins": [dict(r) for r in conn.execute(
+                    "SELECT at, email, ip, ok, reason FROM login_log ORDER BY id DESC LIMIT 30")],
+            }
+        finally:
+            conn.close()
+
+    def end_session(self, session_id):
+        return self.delete_row("sessions", session_id, "Sitzung nicht gefunden.")
+
     # Werbe-Einwilligungen (DSGVO, § 174 TKG)
 
     @staticmethod
@@ -2114,12 +2312,24 @@ class Api:
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".woff2": "font/woff2",
+    ".png": "image/png", ".webmanifest": "application/manifest+json; charset=utf-8",
 }
 
 
-def make_handler(api, port):
+def make_handler(api, port, public_url=None):
+    """public_url gesetzt = Server-Modus: Zugriff über diese Adresse, nur nach Anmeldung."""
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
+    server_mode = bool(public_url)
+    secure_cookie = False
+    if server_mode:
+        public = urlparse(public_url)
+        allowed_hosts.add(public.netloc)
+        allowed_origins.add(f"{public.scheme}://{public.netloc}")
+        # Ohne HTTPS nur zum Testen auf dem eigenen Rechner.
+        secure_cookie = public.scheme == "https"
+        if not secure_cookie and public.hostname not in ("127.0.0.1", "localhost"):
+            raise SystemExit("Im Server-Modus ist HTTPS Pflicht (zum Beispiel https://crm.meerkoetter.at).")
 
     routes = [
         ("GET", r"/api/meta", lambda m, q, b: api.meta()),
@@ -2191,6 +2401,8 @@ def make_handler(api, port):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            if secure_cookie:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -2231,8 +2443,8 @@ def make_handler(api, port):
 
         def recognize_text(self):
             """Liest den Text eines Bildes. Das Bild liegt nur kurz in einem temporären Ordner."""
-            if sys.platform not in ("darwin", "win32"):
-                raise ApiError(501, "Die Texterkennung gibt es nur auf Mac und Windows.")
+            if sys.platform not in ("darwin", "win32") and not TESSERACT:
+                raise ApiError(501, "Für die Texterkennung auf diesem Server fehlt Tesseract (tesseract-ocr-deu).")
             suffix = IMAGE_TYPES.get(self.headers.get_content_type())
             if not suffix:
                 raise ApiError(415, "Bitte ein Bild (PNG oder JPG) einfügen.")
@@ -2246,7 +2458,9 @@ def make_handler(api, port):
             with tempfile.TemporaryDirectory() as folder:
                 image = Path(folder) / f"bild{suffix}"
                 image.write_bytes(data)
-                if sys.platform == "win32":
+                if sys.platform not in ("darwin", "win32"):
+                    command = [TESSERACT, str(image), "stdout", "-l", "deu", "--psm", "11", "tsv"]
+                elif sys.platform == "win32":
                     command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                "-File", str(OCR_SCRIPT_WINDOWS), str(image)]
                 else:
@@ -2260,8 +2474,8 @@ def make_handler(api, port):
                 self.log_error("Texterkennung: %s", done.stderr.strip()[:300])
                 raise ApiError(500, "Die Texterkennung hat nicht funktioniert.")
             try:
-                lines = json.loads(done.stdout)
-            except json.JSONDecodeError:
+                lines = tesseract_lines(done.stdout) if sys.platform not in ("darwin", "win32") else json.loads(done.stdout)
+            except (json.JSONDecodeError, ValueError):
                 raise ApiError(500, "Die Texterkennung hat nicht funktioniert.")
             return {"lines": lines}
 
@@ -2296,6 +2510,40 @@ def make_handler(api, port):
             except json.JSONDecodeError:
                 raise ApiError(500, "Die PDF ließ sich nicht lesen.")
 
+        def client_ip(self):
+            ip = self.client_address[0]
+            # Hinter dem eigenen Reverse-Proxy (Caddy) steht die echte Adresse im letzten Eintrag.
+            if server_mode and ip in ("127.0.0.1", "::1") and self.headers.get("X-Forwarded-For"):
+                ip = self.headers["X-Forwarded-For"].split(",")[-1].strip()
+            return ip[:64]
+
+        def session_token(self):
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                name, _, value = part.strip().partition("=")
+                if name == COOKIE:
+                    return value
+            return ""
+
+        def cookie(self, token, max_age):
+            flags = "; Secure" if secure_cookie else ""
+            return f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{flags}"
+
+        def auth(self, path):
+            """Anmeldung: /auth/status, /auth/login, /auth/logout."""
+            if path == "/auth/status" and self.command == "GET":
+                user = api.session_user(self.session_token()) if server_mode else None
+                self.send_json(200, {"mode": "server" if server_mode else "lokal", "user": user and {"email": user["email"]}})
+            elif path == "/auth/login" and self.command == "POST" and server_mode:
+                token, user = api.login(self.read_json(), self.client_ip(), self.headers.get("User-Agent"))
+                body = json.dumps({"user": user}).encode()
+                self.send_bytes(200, body, "application/json; charset=utf-8",
+                                {"Set-Cookie": self.cookie(token, int(SESSION_MAX.total_seconds()))})
+            elif path == "/auth/logout" and self.command == "POST":
+                api.logout(self.session_token())
+                self.send_bytes(200, b'{"ok": true}', "application/json; charset=utf-8", {"Set-Cookie": self.cookie("", 0)})
+            else:
+                raise ApiError(404, "Nicht gefunden.")
+
         def dispatch(self):
             if not self.request_allowed():
                 self.send_json(403, {"error": "Zugriff nicht erlaubt."})
@@ -2305,12 +2553,28 @@ def make_handler(api, port):
             if path.startswith("/v1/"):
                 self.external(parsed)
                 return
+            if path.startswith("/auth/"):
+                try:
+                    self.auth(path)
+                except ApiError as err:
+                    self.send_json(err.status, {"error": err.message})
+                return
+            if server_mode and path.startswith("/api/") and not api.session_user(self.session_token()):
+                self.send_json(401, {"error": "Bitte anmelden.", "login": True})
+                return
             try:
                 if path == "/api/ocr" and self.command == "POST":
                     self.send_json(200, self.recognize_text())
                     return
                 if path == "/api/pdf" and self.command == "POST":
                     self.send_json(200, self.read_pdf_text())
+                    return
+                if path == "/api/sessions" and self.command == "GET":
+                    self.send_json(200, {**api.security_overview(), "mode": "server" if server_mode else "lokal"})
+                    return
+                match = re.fullmatch(r"/api/sessions/(\d+)", path)
+                if match and self.command == "DELETE":
+                    self.send_json(200, api.end_session(int(match[1])))
                     return
                 if path == "/api/backup" and self.command == "GET":
                     name = f"Meerkoetter-CRM-Daten-{datetime.now().strftime('%Y-%m-%d-%H%M')}.crmdaten"
@@ -2407,6 +2671,39 @@ def make_handler(api, port):
     return Handler
 
 
+TESSERACT = shutil.which("tesseract") if sys.platform not in ("darwin", "win32") else None
+
+
+def tesseract_lines(tsv):
+    """Wandelt die TSV-Ausgabe von Tesseract in dasselbe Format wie ocr.js um (Tausendstel der Bildgröße)."""
+    rows = [line.split("\t") for line in tsv.splitlines()]
+    if not rows or rows[0][:1] != ["level"]:
+        raise ValueError("keine TSV-Ausgabe")
+    head = {name: i for i, name in enumerate(rows[0])}
+    page_w = page_h = 1
+    groups, current = {}, {}
+    for r in rows[1:]:
+        if len(r) < len(head):
+            continue
+        level = int(r[head["level"]])
+        left, top, width, height = (int(r[head[k]]) for k in ("left", "top", "width", "height"))
+        if level == 1:
+            page_w, page_h = max(width, 1), max(height, 1)
+        if level != 5 or not r[head["text"]].strip():
+            continue
+        line = (r[head["block_num"]], r[head["par_num"]], r[head["line_num"]])
+        g = current.get(line)
+        # Weit auseinander stehende Wörter (Beschriftung links, Betrag rechts) als eigene Zeilen behandeln.
+        if g is None or left - g["r"] > 4 * height:
+            g = {"words": [], "l": left, "t": top, "r": left + width, "b": top + height}
+            groups[len(groups)] = current[line] = g
+        g["words"].append(r[head["text"]])
+        g["l"], g["t"] = min(g["l"], left), min(g["t"], top)
+        g["r"], g["b"] = max(g["r"], left + width), max(g["b"], top + height)
+    return [{"y": round(g["t"] / page_h * 1000), "x": round(g["l"] / page_w * 1000),
+             "h": round((g["b"] - g["t"]) / page_h * 1000), "text": " ".join(g["words"])} for g in groups.values()]
+
+
 def pdf_text_portable(data):
     """PDF-Text ohne macOS (Windows): mit dem mitgelieferten Modul pypdf, gleiche Ausgabe wie pdftext.js."""
     try:
@@ -2422,7 +2719,7 @@ def pdf_text_portable(data):
         raise ApiError(500, f"Die PDF ließ sich nicht lesen ({type(err).__name__}).")
 
 
-def create_server(port=4390, data_dir=DEFAULT_DATA_DIR):
+def create_server(port=4390, data_dir=DEFAULT_DATA_DIR, public_url=None):
     """Bereitet die Datenablage vor und liefert den Server, ohne ihn zu starten."""
     data_dir.mkdir(parents=True, exist_ok=True)
     data_dir.chmod(0o700)
@@ -2432,17 +2729,40 @@ def create_server(port=4390, data_dir=DEFAULT_DATA_DIR):
     db.migrate(backups)
     db_path.chmod(0o600)
     db.backup(backups)
-    return ThreadingHTTPServer((HOST, port), make_handler(Api(db, backups), port))
+    return ThreadingHTTPServer((HOST, port), make_handler(Api(db, backups), port, public_url))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lokales CRM")
+    parser = argparse.ArgumentParser(description="Meerkötter CRM")
     parser.add_argument("--port", type=int, default=4390)
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR, help="Ordner für Datenbank und Sicherungen")
+    parser.add_argument("--server", metavar="URL",
+                        help="Server-Modus mit Anmeldung, erreichbar unter dieser HTTPS-Adresse (hinter Caddy)")
+    parser.add_argument("--benutzer", metavar="E-MAIL",
+                        help="Konto für den Server-Modus anlegen oder Passwort und zweiten Faktor neu setzen")
     args = parser.parse_args()
 
-    server = create_server(args.port, args.data)
-    print(f"CRM läuft auf http://{HOST}:{args.port}  (Daten: {args.data})  Beenden mit Strg+C", flush=True)
+    if args.benutzer:
+        args.data.mkdir(parents=True, exist_ok=True)
+        db = Database(args.data / "crm.sqlite")
+        db.migrate(args.data / "Sicherungen")
+        password = getpass.getpass(f"Neues Passwort (mindestens {MIN_PASSWORD} Zeichen): ")
+        if password != getpass.getpass("Passwort wiederholen: "):
+            raise SystemExit("Die Passwörter stimmen nicht überein.")
+        try:
+            secret = Api(db).create_user(args.benutzer, password)
+        except ApiError as err:
+            raise SystemExit(err.message)
+        label = f"Meerkoetter CRM:{args.benutzer.strip().lower()}"
+        print("\nKonto bereit. In der Authenticator-App einen neuen Eintrag anlegen:")
+        print(f"  Schlüssel (manuell eingeben): {secret}")
+        print(f"  oder als Link: otpauth://totp/{label.replace(' ', '%20')}?secret={secret}&issuer=Meerkoetter%20CRM")
+        print("Den Schlüssel nirgends sonst speichern. Bestehende Sitzungen dieses Kontos wurden beendet.")
+        return
+
+    server = create_server(args.port, args.data, args.server)
+    where = f"{args.server} (Anmeldung nötig)" if args.server else f"http://{HOST}:{args.port}"
+    print(f"CRM läuft auf {where}  (Daten: {args.data})  Beenden mit Strg+C", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

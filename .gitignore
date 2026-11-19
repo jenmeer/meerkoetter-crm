@@ -10,6 +10,7 @@
 !/pdftext.js
 !/static/
 !/packaging/
+!/deploy/
 !/tests/
 !/requirements.txt
 !/README.md

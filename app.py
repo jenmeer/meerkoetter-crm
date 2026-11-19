@@ -57,8 +57,25 @@ class Bridge:
         return {"saved": target.name}
 
 
+def remote_url():
+    """Läuft das CRM zentral auf einem Server, steht dessen Adresse in server-adresse.txt im Datenordner."""
+    try:
+        url = (DATA_DIR / "server-adresse.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return url if url.startswith("https://") else None
+
+
 def main():
     quiet_streams(DATA_DIR)
+    remote = remote_url()
+    if remote:
+        # Zentraler Betrieb: kein lokaler Server, das Fenster zeigt die Webapp auf dem Server (mit Anmeldung).
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        webview.settings["ALLOW_DOWNLOADS"] = True
+        webview.create_window(TITLE, remote, width=1320, height=880, min_size=(900, 600), text_select=True)
+        webview.start(private_mode=False, storage_path=str(DATA_DIR / "Fenster"))
+        return
     httpd = None
     if not already_running():
         try:

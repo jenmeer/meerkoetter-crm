@@ -39,7 +39,8 @@ def balance_image():
     from PIL import Image, ImageDraw, ImageFont
     image = Image.new("RGB", (1400, 640), "white")
     draw = ImageDraw.Draw(image)
-    candidates = ["arial.ttf", "Arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+    candidates = ["arial.ttf", "Arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf",
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
     font = big = None
     for name in candidates:
         try:
@@ -150,5 +151,72 @@ def main():
             httpd.server_close()
 
 
+def server_mode():
+    """Server-Modus: ohne Anmeldung keine Daten, Passwort plus Einmalcode, Sperre nach Fehlversuchen."""
+    import http.cookiejar
+    import time
+    port = free_port()
+    with tempfile.TemporaryDirectory() as folder:
+        data = Path(folder) / "daten"
+        httpd = server.create_server(port, data, f"http://127.0.0.1:{port}")
+        api = server.Api(server.Database(data / "crm.sqlite"))
+        secret = api.create_user("Test@Example.com", "ein langes Testpasswort")
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+        def post(path, body):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with opener.open(req) as res:
+                    return res.status
+            except urllib.error.HTTPError as err:
+                return err.code
+
+        def get(path):
+            try:
+                with opener.open(f"http://127.0.0.1:{port}{path}") as res:
+                    return res.status
+            except urllib.error.HTTPError as err:
+                return err.code
+        try:
+            assert get("/api/companies") == 401
+            assert get("/api/backup") == 401
+            assert get("/") == 200  # Programmdateien ohne Daten sind frei
+            code = server.totp_code(secret, int(time.time() // 30))
+            assert post("/auth/login", {"email": "test@example.com", "password": "falsch falsch falsch", "code": code}) == 401
+            assert post("/auth/login", {"email": "test@example.com", "password": "ein langes Testpasswort", "code": "000000"}) == 401
+            assert post("/auth/login", {"email": "test@example.com", "password": "ein langes Testpasswort", "code": code}) == 200
+            assert get("/api/companies") == 200
+            cookie = next(c for c in jar if c.name == "crm_sitzung")
+            assert cookie.has_nonstandard_attr("HttpOnly")
+            # Derselbe Code ein zweites Mal gilt nicht (Schutz vor Wiederverwendung).
+            jar.clear()
+            assert post("/auth/login", {"email": "test@example.com", "password": "ein langes Testpasswort", "code": code}) == 401
+            for _ in range(5):
+                post("/auth/login", {"email": "test@example.com", "password": "falsch falsch falsch", "code": "123456"})
+            next_code = server.totp_code(secret, int(time.time() // 30) + 1)
+            assert post("/auth/login", {"email": "test@example.com", "password": "ein langes Testpasswort", "code": next_code}) == 429
+            print("Server-Modus mit Anmeldung: ok")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+def tesseract_format():
+    tsv = ("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+           "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t\n"
+           "5\t1\t1\t1\t1\t1\t40\t100\t200\t20\t96\tBilanzsumme\n"
+           "5\t1\t1\t1\t1\t2\t700\t100\t20\t20\t96\t€\n"
+           "5\t1\t1\t1\t1\t3\t725\t100\t120\t20\t96\t2.400.000\n")
+    lines = server.tesseract_lines(tsv)
+    assert [l["text"] for l in lines] == ["Bilanzsumme", "€ 2.400.000"], lines
+    assert lines[1]["x"] == 700 and lines[0]["y"] == 200, lines
+    print("Tesseract-Format: ok")
+
+
 if __name__ == "__main__":
     main()
+    server_mode()
+    tesseract_format()

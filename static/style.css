@@ -275,3 +275,26 @@ select.compact{width:auto;margin:0;padding:4px 6px;font-size:13px}
 .tokenbox{font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all;background:var(--hell);border:1px solid var(--linie);border-radius:6px;padding:10px}
 .subhead{font:600 13px var(--lese);text-transform:uppercase;letter-spacing:.04em;color:var(--neben);margin:14px 0 6px}
 @media (max-width: 900px){.areafilter{order:3}}
+
+/* Anmeldung */
+body.logged-out .mainnav, body.logged-out .areafilter, body.logged-out .global-search, body.logged-out .top-actions{display:none}
+.login{max-width:380px;margin:6vh auto 0;text-align:center}
+.login .form{text-align:left;margin-top:18px;background:var(--weiss);border:1px solid var(--linie);border-radius:10px;padding:22px}
+.login-mark{width:56px;height:56px}
+.login h1{margin:8px 0 0}
+
+/* Handy und installierte Webapp */
+.topbar-inner{padding-top:max(10px, env(safe-area-inset-top))}
+@media (max-width:640px){
+  .topbar{position:sticky}
+  .topbar-inner{gap:8px 12px}
+  .brand img{height:30px}
+  .mainnav{flex-wrap:nowrap;overflow-x:auto;gap:18px;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding-bottom:2px}
+  .mainnav::-webkit-scrollbar{display:none}
+  .mainnav a{white-space:nowrap}
+  .areafilter{order:4}
+  .global-search{order:4;flex:1 1 0;min-width:0}
+  .areafilter button{padding:5px 10px}
+  .detail .card, .stack .card{padding:16px}
+  .tablewrap{margin:0 -4px}
+}

@@ -54,7 +54,11 @@ Jeder Aufruf braucht einen Zugangsschlüssel aus **Einstellungen → Schnittstel
 
 Einträge haben eine feste Kennung (`uid`), die sich nie ändert. Damit lassen sich die Daten später zwischen Rechnern oder mit einem Server abgleichen.
 
-Hinweis: Die Schnittstelle antwortet derzeit nur auf dem Rechner, auf dem das CRM läuft. Damit die Webseite sie erreicht, muss das CRM zentral betrieben werden. Dann braucht auch die Oberfläche selbst eine Anmeldung.
+Hinweis: Die Schnittstelle antwortet nur, wenn das CRM zentral läuft (siehe unten). Auf dem Mac allein ist sie von außen nicht erreichbar.
+
+## Unterwegs: Webapp und zentraler Betrieb
+
+Mit `--server https://crm.meerkoetter.at` läuft das CRM im Server-Modus: Anmeldung mit Passwort und Einmalcode aus einer Authenticator-App, Sitzungen mit Ablauf, Sperre nach Fehlversuchen. Die Oberfläche lässt sich am Handy als Webapp installieren und speichert nur Programmdateien, nie Kundendaten. Einrichtung Schritt für Schritt: [deploy/ANLEITUNG-SERVER.md](deploy/ANLEITUNG-SERVER.md).
 
 ## Entwicklung
 

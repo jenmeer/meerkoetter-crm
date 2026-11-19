@@ -1,0 +1,11 @@
+# Caddy holt das HTTPS-Zertifikat selbst (Let's Encrypt) und erneuert es automatisch.
+# Das CRM selbst lauscht nur auf 127.0.0.1 und ist von außen nur über Caddy erreichbar.
+crm.meerkoetter.at {
+	encode gzip
+	reverse_proxy 127.0.0.1:4390
+	header {
+		-Server
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+	# Kein Zugriffsprotokoll: Adressen können Namen und Suchbegriffe enthalten.
+}

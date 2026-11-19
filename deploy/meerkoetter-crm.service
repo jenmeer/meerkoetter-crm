@@ -1,0 +1,33 @@
+# systemd-Dienst für das CRM im Server-Modus. Ablage: /etc/systemd/system/meerkoetter-crm.service
+[Unit]
+Description=Meerkoetter CRM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=crm
+Group=crm
+WorkingDirectory=/opt/meerkoetter-crm
+ExecStart=/opt/meerkoetter-crm/venv/bin/python /opt/meerkoetter-crm/server.py --port 4390 --data /var/lib/meerkoetter-crm --server https://crm.meerkoetter.at
+Restart=on-failure
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Abschottung: Der Dienst darf nur in seinen Datenordner schreiben und nichts sonst.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/meerkoetter-crm
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
