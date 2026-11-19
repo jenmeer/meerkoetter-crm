@@ -1,0 +1,4 @@
+*
+!server.py
+!static/
+!deploy/qnap/start.sh

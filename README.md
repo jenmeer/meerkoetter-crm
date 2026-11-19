@@ -58,7 +58,10 @@ Hinweis: Die Schnittstelle antwortet nur, wenn das CRM zentral läuft (siehe unt
 
 ## Unterwegs: Webapp und zentraler Betrieb
 
-Mit `--server https://crm.meerkoetter.at` läuft das CRM im Server-Modus: Anmeldung mit Passwort und Einmalcode aus einer Authenticator-App, Sitzungen mit Ablauf, Sperre nach Fehlversuchen. Die Oberfläche lässt sich am Handy als Webapp installieren und speichert nur Programmdateien, nie Kundendaten. Einrichtung Schritt für Schritt: [deploy/ANLEITUNG-SERVER.md](deploy/ANLEITUNG-SERVER.md).
+Mit `--server https://crm.meerkoetter.at` läuft das CRM im Server-Modus: Anmeldung mit Passwort und Einmalcode aus einer Authenticator-App, Sitzungen mit Ablauf, Sperre nach Fehlversuchen. Die Oberfläche lässt sich am Handy als Webapp installieren und speichert nur Programmdateien, nie Kundendaten. Einrichtung Schritt für Schritt:
+
+- **Zu Hause auf der QNAP, ohne offenen Port (empfohlen):** [deploy/qnap/ANLEITUNG-QNAP.md](deploy/qnap/ANLEITUNG-QNAP.md), Container `ghcr.io/jenmeer/meerkoetter-crm` mit Tailscale
+- **Auf einem eigenen Server:** [deploy/ANLEITUNG-SERVER.md](deploy/ANLEITUNG-SERVER.md)
 
 ## Entwicklung
 

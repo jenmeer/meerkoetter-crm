@@ -1,0 +1,11 @@
+// Zugriffsregeln für login.tailscale.com → Access controls. Ersetzt die Standardregel "alle dürfen alles".
+// Deine Geräte erreichen ausschließlich das CRM (Port 443). Das CRM selbst darf niemanden ansprechen.
+{
+  "tagOwners": {
+    "tag:crm": ["autogroup:admin"]
+  },
+  "acls": [
+    { "action": "accept", "src": ["autogroup:member"], "dst": ["tag:crm:443"] }
+  ],
+  "ssh": []
+}

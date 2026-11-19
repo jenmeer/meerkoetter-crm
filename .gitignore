@@ -11,6 +11,8 @@
 !/static/
 !/packaging/
 !/deploy/
+!/Dockerfile
+!/.dockerignore
 !/tests/
 !/requirements.txt
 !/README.md

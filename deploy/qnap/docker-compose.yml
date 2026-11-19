@@ -1,0 +1,34 @@
+# Meerkötter CRM auf der QNAP (Container Station → Anwendungen → Erstellen, diesen Inhalt einfügen).
+# Nur das CRM wird ein Gerät in deinem privaten Tailscale-Netz, die NAS selbst nicht.
+# Im Router wird nichts freigegeben; die Verbindung baut der Container von innen auf.
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.104.7
+    hostname: crm
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}          # nur beim ersten Start nötig, danach leer lassen
+      TS_EXTRA_ARGS: --advertise-tags=tag:crm
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "true"                 # kein Zugriff auf das Netz der NAS nötig
+    volumes:
+      - /share/CRM/tailscale:/var/lib/tailscale
+      - /share/CRM/serve.json:/config/serve.json:ro
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  crm:
+    image: ghcr.io/jenmeer/meerkoetter-crm:1.2.0
+    network_mode: service:tailscale         # nur über Tailscale erreichbar, kein Port an der NAS
+    environment:
+      CRM_URL: ${CRM_URL}                   # https://crm.<dein-netz>.ts.net
+    volumes:
+      - /share/CRM/daten:/data              # verschlüsselter freigegebener Ordner
+    depends_on: [tailscale]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, FOWNER]
+    security_opt: [no-new-privileges:true]
